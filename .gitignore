@@ -17,3 +17,7 @@ build/
 *.pfx
 *.pem
 azure-credentials.json
+
+# Filled-in Bicep parameters. Only the placeholder example is committed.
+infra/main.parameters.json
+!infra/main.parameters.example.json

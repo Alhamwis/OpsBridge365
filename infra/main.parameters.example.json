@@ -1,0 +1,43 @@
+{
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#",
+  "contentVersion": "1.0.0.0",
+  "_comment": [
+    "TEMPLATE ONLY - every value below is a placeholder. Copy this file to",
+    "infra/main.parameters.json (gitignored) and fill it in.",
+    "Leave clientSecret empty here and pass it on the command line instead:",
+    "  --parameters clientSecret=$env:GRAPH_CLIENT_SECRET",
+    "so the real secret never touches a file in the repo. This repo is public."
+  ],
+  "parameters": {
+    "location": {
+      "value": "eastus"
+    },
+    "namePrefix": {
+      "value": "opsbridge"
+    },
+    "containerImage": {
+      "value": "ghcr.io/YOUR-GITHUB-USERNAME/opsbridge365:latest"
+    },
+    "tenantId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "clientId": {
+      "value": "00000000-0000-0000-0000-000000000000"
+    },
+    "clientSecret": {
+      "value": ""
+    },
+    "sharePointSiteId": {
+      "value": "REPLACE-WITH-SHAREPOINT-SITE-ID"
+    },
+    "assetsListId": {
+      "value": "REPLACE-WITH-ASSETS-LIST-ID"
+    },
+    "ticketsListId": {
+      "value": "REPLACE-WITH-TICKETS-LIST-ID"
+    },
+    "syncCron": {
+      "value": "0 */6 * * *"
+    }
+  }
+}
