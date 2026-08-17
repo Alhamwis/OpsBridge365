@@ -8,6 +8,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from fastapi.testclient import TestClient
 
+from app import __version__
 from app.graph import GraphAuthError, GraphHTTPError
 from app.main import app, get_sharepoint_client
 from app.models import Ticket
@@ -41,9 +42,21 @@ def test_healthz_reports_status_and_version(client: TestClient) -> None:
     assert response.json() == {"status": "ok", "version": "9.9.9-test"}
 
 
-def test_healthz_is_503_when_configuration_is_missing(clean_env: None) -> None:
+def test_healthz_is_still_200_when_configuration_is_missing(clean_env: None) -> None:
+    # A container HEALTHCHECK runs before credentials are mounted, and an
+    # unconfigured container is unhealthy for the operator, not for the
+    # orchestrator. /healthz answers regardless; /metrics is what 503s.
     with TestClient(app) as test_client:
         response = test_client.get("/healthz")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "version": __version__}
+    assert "AZURE_CLIENT_SECRET" not in response.text  # no variable names leaked to callers
+
+
+def test_metrics_is_503_when_configuration_is_missing(clean_env: None) -> None:
+    with TestClient(app) as test_client:
+        response = test_client.get("/metrics")
 
     assert response.status_code == 503
     body = response.text

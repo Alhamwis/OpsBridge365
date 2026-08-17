@@ -1,0 +1,53 @@
+# Everything here is either a secret, a test artefact, or dead weight in a
+# runtime image. Anything the build genuinely needs is re-included explicitly.
+
+# --- secrets: never, under any circumstances, in the build context ---
+.env
+.env.*
+*.secret
+secrets.json
+azure-credentials.json
+*.pem
+*.pfx
+*.key
+
+# --- VCS and CI ---
+.git
+.gitignore
+.github
+.gitattributes
+
+# --- tests and their tooling ---
+tests/
+conftest.py
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# --- documentation and evidence ---
+docs/
+evidence/
+*.md
+# pyproject's `readme` field points at README.md, so the build needs that one.
+# (.dockerignore has no trailing-comment syntax - the exception gets its own line.)
+!README.md
+
+# --- python build/runtime junk ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# --- local state and editor config ---
+opsbridge-state.json
+.vscode/
+.idea/
+.DS_Store
+Dockerfile
+.dockerignore

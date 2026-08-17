@@ -54,8 +54,19 @@ async def _config_error_handler(_request: Request, exc: ConfigError) -> JSONResp
 
 @app.get("/healthz", response_model=HealthResponse)
 async def healthz() -> HealthResponse:
-    """Liveness probe. Reports the deployed version, nothing else."""
-    return HealthResponse(status="ok", version=get_settings().app_version)
+    """Liveness probe. Reports the deployed version, nothing else.
+
+    Deliberately independent of configuration: a container health probe must
+    answer before any Azure credential is mounted, otherwise the orchestrator
+    kills a container that is merely unconfigured. Missing credentials surface
+    on /metrics, which is the endpoint that actually needs them.
+    """
+    try:
+        version = get_settings().app_version
+    except ConfigError as exc:
+        logger.warning("Serving /healthz without configuration: %s", exc)
+        version = __version__
+    return HealthResponse(status="ok", version=version)
 
 
 @app.get("/metrics", response_model=MetricsResponse)
