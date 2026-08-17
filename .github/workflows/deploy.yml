@@ -1,0 +1,312 @@
+# =============================================================================
+# OpsBridge365 - build, publish, deploy
+# =============================================================================
+# push to main (or manual dispatch)
+#   -> test        pytest + ruff; gates everything below
+#   -> build-push  image to ghcr.io (free public registry, GITHUB_TOKEN only)
+#   -> deploy      az deployment group create against infra/main.bicep,
+#                  authenticated with OIDC federation - no stored password
+#
+# There is no client secret and no `creds:` JSON anywhere in this file. The only
+# credential used against Azure is a short-lived OIDC token minted by GitHub for
+# this repository and exchanged for an access token by the federated app
+# registration. `id-token: write` is what allows that mint; nothing else does.
+#
+# TWO SEPARATE APP REGISTRATIONS. This is deliberate, and merging them back into
+# one to save a few clicks re-introduces the exact hole the split closes:
+#
+#   opsbridge-deploy  - deploys to Azure. OIDC federated credential, NO SECRET.
+#                       Has ARM rights on one resource group. No Graph perms.
+#   opsbridge-graph   - runtime Graph caller. HAS a client secret. Graph
+#                       application permissions only, NO Azure RBAC at all.
+#
+# If the two are one app, the long-lived Graph secret also carries ARM rights on
+# the resource group, so leaking it hands over the Azure scope as well as Graph -
+# and the stored credential defeats the point of using OIDC in the first place.
+#
+# ---------------- identity A: opsbridge-deploy (OIDC, no secret) -------------
+# | Secret                 | What it is                                       |
+# |------------------------|--------------------------------------------------|
+# | AZURE_CLIENT_ID        | App (client) id of the DEPLOY app registration.  |
+# |                        | Used by `azure/login` and NOWHERE ELSE in this   |
+# |                        | file. This app has no client secret.             |
+# | AZURE_TENANT_ID        | Directory (tenant) id. Shared by both identities |
+# |                        | (they live in the same tenant); a tenant id is a |
+# |                        | public identifier, not a credential.             |
+# | AZURE_SUBSCRIPTION_ID  | Subscription the resource group lives in.        |
+#
+# ---------------- identity B: opsbridge-graph (secret, no ARM) ---------------
+# | Secret                 | What it is                                       |
+# |------------------------|--------------------------------------------------|
+# | GRAPH_CLIENT_ID        | App (client) id of the GRAPH app registration.   |
+# |                        | Passed to Bicep as `clientId`. Never used to     |
+# |                        | authenticate this workflow to Azure.             |
+# | GRAPH_CLIENT_SECRET    | Client secret of the GRAPH app - the only stored |
+# |                        | password in the system. Passed to Bicep, which   |
+# |                        | puts it in Key Vault for the *containers* to     |
+# |                        | read. This app holds no Azure RBAC role, so the  |
+# |                        | secret grants Graph access and nothing more.     |
+#
+# ---------------- data locations (identifiers, not credentials) --------------
+# | Secret                 | What it is                                       |
+# |------------------------|--------------------------------------------------|
+# | SHAREPOINT_SITE_ID     | Graph id of the SharePoint site.                 |
+# | ASSETS_LIST_ID         | Graph id of the Assets list (written by sync).   |
+# | TICKETS_LIST_ID        | Graph id of the Tickets list (read by /metrics). |
+#
+# -------------------------------- optional repository variables --------------
+# | Variable               | Default              | Meaning                    |
+# |------------------------|----------------------|----------------------------|
+# | AZURE_RESOURCE_GROUP   | opsbridge365-rg      | Target resource group      |
+# | AZURE_LOCATION         | eastus               | Region if the RG is new    |
+# | NAME_PREFIX            | opsbridge            | Bicep namePrefix param     |
+#
+# Full setup (including the federated-credential subject) is in
+# docs/DEPLOYMENT.md.
+# =============================================================================
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Least privilege, and every entry is load-bearing:
+#   contents: read   - checkout
+#   packages: write  - push to ghcr.io with GITHUB_TOKEN
+#   id-token: write  - mint the OIDC token azure/login exchanges
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+# One deploy at a time. Not cancel-in-progress: killing a job midway through
+# `az deployment group create` leaves the resource group half-updated.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ------------------------------------------------------------------ test --
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install project (dev extras)
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Lint (ruff)
+        # Advisory: style regressions report but do not block a deploy. The
+        # tests below are the gate.
+        continue-on-error: true
+        run: ruff check .
+
+      - name: Tests (pytest)
+        run: python -m pytest -q
+
+  # -------------------------------------------------------- build and push --
+  build-and-push:
+    name: build and push to ghcr.io
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      image-latest: ${{ steps.ref.outputs.image-latest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Compute image reference
+        id: ref
+        # GHCR rejects uppercase path segments; github.repository preserves the
+        # owner's casing, so lowercase it rather than trusting the repo name.
+        run: |
+          name="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          echo "name=${name}"                       >> "$GITHUB_OUTPUT"
+          echo "image=${name}:${GITHUB_SHA}"        >> "$GITHUB_OUTPUT"
+          echo "image-latest=${name}:latest"        >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        # The built-in GITHUB_TOKEN - no PAT to create, rotate or leak. And no
+        # Azure Container Registry: a public GHCR package is free and Container
+        # Apps pulls it with no registry credentials at all.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ref.outputs.image-latest }}
+            ${{ steps.ref.outputs.image }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image published"
+            echo ""
+            echo '- `${{ steps.ref.outputs.image-latest }}`'
+            echo '- `${{ steps.ref.outputs.image }}`'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- deploy --
+  deploy:
+    name: deploy to Azure
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure login (OIDC, passwordless)
+        # AZURE_CLIENT_ID is the *deploy* identity and is used here only. The
+        # Graph runtime identity is a different app registration entirely; see
+        # GRAPH_CLIENT_ID in the deploy step below.
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Ensure resource group
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'opsbridge365-rg' }}
+          LOCATION: ${{ vars.AZURE_LOCATION || 'eastus' }}
+        run: |
+          set -euo pipefail
+          az group create \
+            --name "$RESOURCE_GROUP" \
+            --location "$LOCATION" \
+            --tags project=OpsBridge365 managedBy=github-actions \
+            --only-show-errors -o none
+
+      - name: Deploy infra/main.bicep
+        id: infra
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'opsbridge365-rg' }}
+          NAME_PREFIX: ${{ vars.NAME_PREFIX || 'opsbridge' }}
+          CONTAINER_IMAGE: ${{ needs.build-and-push.outputs.image }}
+          # Secrets reach the CLI through the environment only - never inlined
+          # into the command line, never echoed. No `set -x` in this step.
+          #
+          # These are the GRAPH runtime identity, not the deploy identity. The
+          # deploy identity (AZURE_CLIENT_ID) is deliberately absent from this
+          # step: it has no Graph permissions and must never end up in Key Vault.
+          TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          GRAPH_CLIENT_ID: ${{ secrets.GRAPH_CLIENT_ID }}
+          GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
+          SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
+          ASSETS_LIST_ID: ${{ secrets.ASSETS_LIST_ID }}
+          TICKETS_LIST_ID: ${{ secrets.TICKETS_LIST_ID }}
+        run: |
+          set -euo pipefail
+          outputs=$(az deployment group create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "opsbridge-${GITHUB_SHA::7}" \
+            --template-file infra/main.bicep \
+            --parameters \
+              namePrefix="$NAME_PREFIX" \
+              containerImage="$CONTAINER_IMAGE" \
+              tenantId="$TENANT_ID" \
+              clientId="$GRAPH_CLIENT_ID" \
+              clientSecret="$GRAPH_CLIENT_SECRET" \
+              sharePointSiteId="$SHAREPOINT_SITE_ID" \
+              assetsListId="$ASSETS_LIST_ID" \
+              ticketsListId="$TICKETS_LIST_ID" \
+            --only-show-errors \
+            --query properties.outputs -o json)
+
+          # Only non-secret outputs exist in the template (fqdn, names, ids).
+          echo "api-fqdn=$(echo "$outputs" | jq -r '.apiFqdn.value')" >> "$GITHUB_OUTPUT"
+          echo "job-name=$(echo "$outputs" | jq -r '.jobName.value')" >> "$GITHUB_OUTPUT"
+
+      - name: Verify - GET /healthz returns 200
+        env:
+          FQDN: ${{ steps.infra.outputs.api-fqdn }}
+        run: |
+          set -euo pipefail
+          url="https://${FQDN}/healthz"
+          echo "Probing ${url}"
+          # minReplicas is 0, so the first request after idle pays a cold start.
+          # Retry for up to ~3 minutes, then fail: a deploy that cannot be
+          # verified is a failed deploy.
+          for attempt in $(seq 1 18); do
+            code=$(curl -sS -o /tmp/healthz.json -w '%{http_code}' --max-time 30 "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "healthz 200 on attempt ${attempt}"
+              cat /tmp/healthz.json
+              {
+                echo "### Post-deploy verification"
+                echo ""
+                echo "- \`GET ${url}\` -> **200** (attempt ${attempt})"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "attempt ${attempt}: HTTP ${code}, retrying in 10s"
+            sleep 10
+          done
+          echo "::error::/healthz never returned 200 - failing the deploy"
+          exit 1
+
+      - name: Verify - sync job exists
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'opsbridge365-rg' }}
+          JOB_NAME: ${{ steps.infra.outputs.job-name }}
+        run: |
+          set -euo pipefail
+          az config set extension.use_dynamic_install=yes_without_prompt --only-show-errors -o none
+          trigger=$(az containerapp job show \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$JOB_NAME" \
+            --query properties.configuration.triggerType \
+            --only-show-errors -o tsv)
+          echo "job ${JOB_NAME} trigger type: ${trigger}"
+          if [ "$trigger" != "Schedule" ]; then
+            echo "::error::${JOB_NAME} is missing or is not schedule-triggered"
+            exit 1
+          fi
+          echo "- \`az containerapp job show ${JOB_NAME}\` -> **Schedule**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Azure logout
+        if: always()
+        run: az logout --only-show-errors || true
