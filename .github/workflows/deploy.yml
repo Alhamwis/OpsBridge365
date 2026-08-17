@@ -2,10 +2,17 @@
 # OpsBridge365 - build, publish, deploy
 # =============================================================================
 # push to main (or manual dispatch)
-#   -> test        pytest + ruff; gates everything below
+#   -> secret-scan gitleaks over the FULL git history; a finding fails the run
+#   -> test        pytest + ruff
+#      (those two run in parallel and BOTH gate everything below)
 #   -> build-push  image to ghcr.io (free public registry, GITHUB_TOKEN only)
 #   -> deploy      az deployment group create against infra/main.bicep,
 #                  authenticated with OIDC federation - no stored password
+#
+# secret-scan gates `build-and-push`, which gates `deploy`, so a leaked
+# credential cannot be baked into a published image or shipped to Azure. It is a
+# hard gate: no `continue-on-error`, and scanning history rather than the diff,
+# because a secret removed in a later commit is still a live secret.
 #
 # There is no client secret and no `creds:` JSON anywhere in this file. The only
 # credential used against Azure is a short-lived OIDC token minted by GitHub for
@@ -91,6 +98,25 @@ env:
   PYTHON_VERSION: "3.12"
 
 jobs:
+  # ----------------------------------------------------------- secret scan --
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # The whole history, not a shallow clone - see the note at the top.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
   # ------------------------------------------------------------------ test --
   test:
     name: test
@@ -125,7 +151,9 @@ jobs:
   # -------------------------------------------------------- build and push --
   build-and-push:
     name: build and push to ghcr.io
-    needs: test
+    # Both gates, not just the tests. Nothing is published to ghcr.io - and so
+    # nothing can be deployed to Azure - unless the secret scan is clean.
+    needs: [secret-scan, test]
     runs-on: ubuntu-latest
     permissions:
       contents: read

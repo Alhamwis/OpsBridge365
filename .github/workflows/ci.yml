@@ -1,9 +1,13 @@
 # =============================================================================
 # OpsBridge365 - pull request CI
 # =============================================================================
-# Lint and test only. No registry login, no cloud credentials, no deployment:
-# a pull request from a fork must never be able to touch ghcr.io or Azure, and
-# the way to guarantee that is to never grant the token more than read access.
+# Secret scan, lint and test only. No registry login, no cloud credentials, no
+# deployment: a pull request from a fork must never be able to touch ghcr.io or
+# Azure, and the way to guarantee that is to never grant the token more than
+# read access.
+#
+# The two jobs run in parallel and both must pass. gitleaks scans the full git
+# history, not the diff, and a finding fails the build.
 # =============================================================================
 
 name: ci
@@ -20,9 +24,38 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # ----------------------------------------------------------- secret scan --
+  # Hard gate, not advisory. A finding fails the build; there is no
+  # `continue-on-error` here on purpose. `deploy.yml` runs the same job and
+  # makes the image build depend on it, so nothing reaches ghcr.io or Azure
+  # without a clean scan.
+  secret-scan:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # fetch-depth: 0 is the entire point. The default shallow clone only
+          # has the tip commit, so a secret that was committed and then removed
+          # in a later commit would scan clean - which is exactly the case that
+          # matters, because the credential is still in the history and still
+          # compromised.
+          fetch-depth: 0
+
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+
   test:
     name: lint and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
         uses: actions/checkout@v4

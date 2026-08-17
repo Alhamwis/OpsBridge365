@@ -22,12 +22,15 @@ of the bill, not as a quote. The design goal is **$0 for an idle month**.
 | 2 | `opsbridge-env` | Container Apps managed environment | The runtime both containers live in — networking, log routing, revision management. | **$0** — the environment itself is not billed. You pay for replica seconds, not for the environment. |
 | 3 | `opsbridge<hash>` | Key Vault (standard, **RBAC-enabled**, soft-delete on) | Holds exactly one secret, `graph-client-secret`: the Entra app registration's client secret. Nothing else. | **~$0** — $0.03 per 10,000 operations. Two containers reading one secret a handful of times a day rounds to zero. |
 | 4 | `opsbridge-id` | User-assigned managed identity | The single workload identity shared by the job and the app. Its only permission anywhere in Azure is *read secret values from vault #3*. | **$0** — managed identities are free. |
-| 5 | `opsbridge-sync` | Container Apps **Job** (`triggerType: Schedule`) | Runs `python -m app.sync` on the cron, writes Graph data into the SharePoint Assets list, exits. No scheduler in the image — the cron lives in Azure. | **$0 while idle.** Billed only for the seconds a replica is alive. A 30-second sync every 6 hours at 0.25 vCPU is ~30 vCPU-seconds/month against a 180,000 vCPU-second free grant. |
+| 5 | `opsbridge-sync` | Container Apps **Job** (`triggerType: Schedule`) | Runs `python -m app.sync` on the cron, writes Graph data into the SharePoint Assets list, exits. No scheduler in the image — the cron lives in Azure. | **$0 while idle.** Billed only for the seconds a replica is alive. A 30-second sync every 6 hours at 0.25 vCPU is 120 runs x 30 s x 0.25 vCPU = **~900 vCPU-seconds/month**, or 0.5% of the 180,000 vCPU-second free grant. |
 | 6 | `opsbridge-api` | Container App (external ingress, **`minReplicas: 0`**) | Serves `/healthz` and `/metrics`. Wakes on an HTTP request, sleeps again when traffic stops. | **$0 while idle.** Scale-to-zero means no replica, no bill. The first request after a sleep pays a few seconds of cold start — narrate that as the feature it is. |
 
 Free grant, per subscription per month: **180,000 vCPU-seconds and 360,000
 GiB-seconds**, plus 2 million requests. Both workloads run at 0.25 vCPU /
-0.5 GiB, so the realistic monthly draw is a rounding error against it.
+0.5 GiB, so the realistic monthly draw is a rounding error against it — the sync
+job's ~900 vCPU-seconds is 0.5% of the grant, and the API adds only cold starts.
+The full arithmetic, and the assumptions the $0 depends on, are in
+[`../docs/COST.md`](../docs/COST.md).
 
 Set a budget alert anyway — expected spend is $0, but *knowing where the
 guardrail is* is the point:
@@ -104,9 +107,15 @@ identity, and scale-to-zero — is GA in `2024-03-01`.
 - Azure CLI logged in to the **trial tenant** (`az login --tenant <your-tenant>`)
 - The GHCR package marked **public** — a public image needs no registry
   credentials, which is why there is no `registries:` block in the template
-- Entra app registration with admin consent for `User.Read.All`,
-  `Device.Read.All`, and `Sites.ReadWrite.All` (or `Sites.Selected` scoped to
-  the one site — the stricter choice)
+- Entra app registration with admin consent for exactly three Graph
+  **application** permissions:
+  - `User.Read.All` — read the user list, for device-to-owner matching
+  - `Device.Read.All` — read directory device objects via `GET /devices`. This
+    is the directory permission, not the Intune one; the code does not call
+    Intune. See [`../docs/DEPLOYMENT.md`](../docs/DEPLOYMENT.md#graph-permissions--the-authoritative-list)
+  - `Sites.Selected` — SharePoint access limited to the one provisioned site
+    (`Sites.ReadWrite.All` would grant write on every site in the tenant;
+    `Sites.Selected` is the stricter choice and the one specified)
 
 ### 1. Resource group
 

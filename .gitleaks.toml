@@ -1,0 +1,39 @@
+# =============================================================================
+# gitleaks configuration - OpsBridge365
+# =============================================================================
+# The default gitleaks ruleset is used in full (`useDefault = true`). Nothing is
+# disabled. The single allowlist entry below exists because gitleaks' generic
+# high-entropy rule flags one value that is not a credential.
+#
+# Keep this file minimal. Every entry added here is a place a real secret could
+# hide, so each one carries a justification and the narrowest possible pattern.
+# =============================================================================
+
+title = "OpsBridge365"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = """
+Azure built-in role definition GUIDs are public, fixed identifiers published by
+Microsoft - they are the same in every tenant on earth and grant nothing on
+their own. They are not secrets, but they look like high-entropy strings to the
+generic-api-key rule. Only the specific GUIDs actually used by this template are
+allowlisted, by exact value, so any other high-entropy string still fails.
+
+  4633458b-17de-408a-b874-0445c86b69e6  Key Vault Secrets User
+                                        (infra/main.bicep: keyVaultSecretsUserRoleId)
+"""
+regexTarget = "match"
+regexes = [
+  '''4633458b-17de-408a-b874-0445c86b69e6''',
+]
+
+# Deliberately NOT allowlisted, because they do not need to be - both were
+# scanned clean and must keep being scanned:
+#   .env.example                        every value is empty
+#   infra/main.parameters.example.json  every value is a placeholder or a
+#                                       zero GUID; clientSecret is ""
+# If either ever trips the scanner, the correct fix is to check whether a real
+# value was committed - not to add it here.
