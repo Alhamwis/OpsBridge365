@@ -2,11 +2,15 @@
 
 How OpsBridge365's cloud layer is put together, and why each choice was made.
 
-> **Nothing described here is deployed.** The Bicep template compiles and the
-> container runs locally, but no Azure resource exists yet — see the status table
-> in the [README](../README.md#status). This document describes the design and the
-> code that implements it, in the present tense; it does not claim anything is
-> running.
+> **The topology below is real; the Azure compute in it is not deployed.** Both
+> tenants exist, both app registrations exist, the SharePoint site and both lists
+> exist, and the container image is published. **No resource declared in
+> `infra/main.bicep` exists** — no Log Analytics workspace, no Container Apps
+> environment, no Key Vault, no managed identity, no Job, no API. The template
+> compiles and the container runs locally; neither has been submitted to ARM. See
+> the status table in the [README](../README.md#status). This document describes
+> the design in the present tense; where it names an Azure resource, read that as
+> "declared", not "running".
 
 ---
 
@@ -106,14 +110,19 @@ tickets. Naive timestamps are treated as UTC, which is what SharePoint stores.
 The system spans two Entra tenants, and this is deliberate. The division is not
 "dev and prod" — it is **who pays** versus **who can consent**.
 
+Both tenants exist. The table below describes what is actually in each one, and
+was checked against the live configuration rather than restated from the design.
+
 | | **School tenant** (institutional) | **OpsBridge365 tenant** (personally owned) |
 | --- | --- | --- |
-| Owns | The Azure subscription (student credit), the resource group, and every Azure resource in it | The Microsoft 365 data plane: the SharePoint site with the Assets and Tickets lists, and the users and devices Graph reads |
+| Identity | College (institutional) | OpsBridge365 |
+| Owns | The "Azure for Students" subscription, the resource group `rg-opsbridge365` (`eastus`) and every Azure resource that will live in it | The Microsoft 365 data plane: the SharePoint site with the Assets and Tickets lists, and the users and devices Graph reads |
+| Deployed there today | The resource group and a $20/month budget. **Nothing from `main.bicep`** | The site, both lists (seeded), and the `Sites.Selected` grant |
 | Also holds | The Power Platform service desk: SharePoint lists, Power Apps, flows, Teams | — |
-| App registration | `opsbridge-deploy` — OIDC federated to this repo's `main`, no password, ARM rights on one resource group, **zero Graph permissions** | `opsbridge-graph` — client secret, Graph application permissions, **zero Azure RBAC** |
+| App registration | `opsbridge-deploy` — one OIDC federated credential scoped to this repo's `production` environment, **zero passwords and zero certificates**, Contributor + Role Based Access Control Administrator on one resource group, **zero Graph permissions** | `opsbridge-graph` — client secret, three admin-consented Graph application permissions, zero delegated grants, **zero Azure RBAC** |
 | Auth model | Workload identity federation (deploy); standard connectors and signed-in user context (service desk) | Application permissions, client credentials |
 | Admin rights | None — a student account | Global admin — the tenant was created by, and belongs to, the author |
-| Lifetime | Permanent, no trial clock | Entra tenant permanent; the M365 E5 trial that adds SharePoint runs 30 days |
+| Lifetime | Permanent, no trial clock | Permanent. **M365 Business Standard, not a trial** — there is no 30-day clock on the SharePoint data, which is why the evidence in this repository does not expire |
 
 **Why split at all.** Microsoft Graph *application* permissions — the app-only,
 no-signed-in-user kind this service needs to run unattended on a cron — require
@@ -127,8 +136,11 @@ each half of the system is registered where it actually belongs.
 
 **Why not just run everything in the own tenant.** The service desk half was built
 first, in the institutional tenant, on standard connectors that cost nothing and
-never expire. Moving it would trade a permanent home for a 30-day trial clock —
-and the Azure subscription could not follow anyway.
+never expire, and the Azure subscription could not follow it anyway — student
+credit is not transferable. The original plan also assumed a 30-day E5 trial on
+the own tenant; that was replaced with a paid **M365 Business Standard**
+subscription, which removes the trial clock and means the SharePoint data and the
+evidence captured against it do not expire.
 
 **What this costs, stated plainly.** The sync writes to a SharePoint site in the
 *own* tenant, not the institutional one. Cross-tenant writes would need admin
@@ -227,6 +239,11 @@ all, so `infra/main.bicep` has no `registries:` block, no registry password in K
 Vault, and no image-pull secret to manage. Removing a cost also removed a
 credential.
 
+> **Status.** The image is published (`ghcr.io/alhamwis/opsbridge365:latest` and a
+> sha tag) but the package visibility is still **private**, so anonymous
+> `docker pull` returns `unauthorized`. The template's no-`registries:`-block
+> design depends on that changing; it is a UI-only setting with no REST API.
+
 **The trade.** The image is public — anyone can pull it. It contains no secrets
 (verified: no `.env`, no credentials in any `ARG`/`ENV`, configuration arrives at
 runtime), so the exposure is the application code, which is public anyway. A
@@ -259,8 +276,11 @@ definition, never emitted as a deployment output. Details in
 ## What I would change with more time or a real budget
 
 - **Drop the client secret entirely.** A managed identity with federated
-  credentials against Graph removes the last stored password in the system. It was
-  not done here because it needs a live tenant to configure and test.
+  credentials against Graph removes the last stored password in the system. The
+  earlier reason for not doing it — "it needs a live tenant to configure and
+  test" — no longer holds: the tenant exists. It is now simply undone, and it is
+  the single highest-value remaining security change, because it would empty Key
+  Vault of the one thing in it.
 - **Delta queries.** `list_users` and `list_devices` fetch everything on every
   run. Graph's `/delta` endpoints would fetch only what changed — irrelevant at
   tens of devices, essential at thousands.

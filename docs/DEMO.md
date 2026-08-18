@@ -2,10 +2,13 @@
 
 A run sheet for walking an interviewer through OpsBridge365.
 
-> **Which demo you can give depends on what exists.** Nothing is deployed to Azure
-> today, so **Track B — the local Docker demo — is the one that runs right now**, and
-> it is a complete, honest demo on its own. Track A is written for the day the
-> accounts exist. Do not describe Track A as if it has happened.
+> **Which demo you can give depends on what exists.** No Azure resource from
+> `infra/main.bicep` is deployed, so **Track B — the local Docker demo — is still
+> the one that runs right now**, and it is a complete, honest demo on its own.
+> Track B is now stronger than it was: the accounts are real, so you can also run
+> **12 live integration tests against the real Microsoft 365 tenant** on the spot.
+> Track A — the deployed cloud demo — remains unavailable. Do not describe it as if
+> it has happened.
 
 ---
 
@@ -27,10 +30,10 @@ for everything after it:
 
 > "This is the cloud half of an IT service desk tool — a scheduled job that
 > reconciles device data from Microsoft Graph into a SharePoint asset list, and an
-> API that reports live SLA numbers. It's fully built and tested. It is *not*
-> deployed, because the Azure and Microsoft 365 accounts it needs don't exist yet —
-> that's a signup step, not an engineering one. Everything I show you runs on this
-> laptop."
+> API that reports live SLA numbers. It's built, tested, and the Graph half is
+> verified against a real Microsoft 365 tenant — twelve integration tests hit live
+> Graph. What it is *not* is deployed: the Azure compute isn't up yet. I'll show
+> you exactly where the line is."
 
 Saying that first turns the gap into a stated boundary instead of something they
 discover and you explain away.
@@ -72,7 +75,7 @@ python -m pytest -q
 ```
 
 ```
-58 passed, 10 deselected in 1.82s
+58 passed, 12 deselected
 ```
 
 > "Fifty-eight tests, all offline — httpx is intercepted and MSAL is stubbed, so no
@@ -80,13 +83,29 @@ python -m pytest -q
 > path: 429 and 503 with `Retry-After` honoured, timeouts, transport errors, and
 > malformed JSON."
 
-Then point at the ten deselected:
+Then point at the twelve deselected — and if you have credentials in the
+environment, **run them**:
 
-> "Those ten are the live tests — they hit the real tenant, so they're opt-in with
-> `pytest -m integration`, never in the default run. The one I'd show a security
-> reviewer asks Graph for a site the app was never granted and asserts a 403. That
-> is the difference between `Sites.Selected` and tenant-wide access, and it's an
-> assertion rather than a paragraph in a document."
+```bash
+python -m pytest -m integration -q
+```
+
+```
+12 passed, 58 deselected in 10.06s
+```
+
+> "Those twelve hit the real tenant, so they're opt-in — never in the default run,
+> which means the suite is green on a machine with no credentials. The ones I'd
+> show a security reviewer probe the `Sites.Selected` boundary: data on a site the
+> app was never granted comes back 403, and so does tenant-wide site enumeration.
+> What's interesting is what *doesn't* 403 — that ungranted site's metadata reads
+> back 200. An earlier version of the test asserted 403 there and failed against a
+> correctly configured tenant. The permission withholds a site's data and refuses
+> enumeration; it does not hide that the site exists. I'd rather document that than
+> overclaim it."
+
+If you cannot run them live, the captured output is
+`evidence/graph/live-integration-run.md`.
 
 Then open `app/metrics.py` and point at one line:
 

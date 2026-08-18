@@ -2,16 +2,23 @@
 
 Threat model and controls for the OpsBridge365 cloud layer.
 
-> **Scope note.** Everything below describes controls that are **implemented in
-> the repository** — in the Bicep template, the workflows, the Dockerfile and the
-> code. Nothing has been exercised against a live **Azure subscription**, because
-> none exists yet. The **Microsoft 365 tenant side is different**: the Graph
-> permissions and the `Sites.Selected` boundary have now been probed directly with
-> the app's own token, and the measured results are in
-> [What `Sites.Selected` does and does not hide](#what-sitesselected-does-and-does-not-hide).
-> A control that is designed and committed is not the same as a control that has
-> been observed working, and this document marks which is which. Anything not
-> implemented is listed under [Gaps](#gaps-what-is-not-done).
+> **Scope note.** A control that is designed and committed is not the same as a
+> control that has been observed working, and this document marks which is which.
+>
+> **Observed working:** the two-app identity split (both apps exist; the deploy
+> identity provably holds no credential of any kind), the least-privilege Graph
+> permission set and its programmatically-granted consent, the `Sites.Selected`
+> site boundary probed with the app's own token, the container hardening, and the
+> gitleaks history scan as a gating CI job.
+>
+> **Committed but not exercised:** everything that lives inside
+> `infra/main.bicep` — Key Vault, the Key Vault reference, the managed identity's
+> single role assignment, HTTPS-only ingress. None of those resources exist yet, so
+> every claim about them is a claim about a template that compiles, not about a
+> deployment. The OIDC federation is a special case: it has been exercised, and it
+> **failed** the first time for the reason documented in §1.
+>
+> Anything not implemented at all is listed under [Gaps](#gaps-what-is-not-done).
 
 ---
 
@@ -37,35 +44,98 @@ anywhere in the workflow. GitHub mints a short-lived OIDC token scoped to this
 repository — that is what `id-token: write` buys — `azure/login@v2` exchanges it
 for an access token, and the token dies with the job.
 
-The federated credential's `subject` pins trust to one repository and one ref
-(`repo:OWNER/OpsBridge365:ref:refs/heads/main`, plus one for
-`environment:production`). A mismatch fails as `AADSTS70021: No matching federated
-identity record found` — which is the failure mode you want, because it proves the
-trust really is that narrow.
+The federated credential's `subject` pins trust to one repository and one
+execution context. `opsbridge-deploy` now holds **exactly one** federated
+credential, and its subject is
+`repo:Alhamwis/OpsBridge365:environment:production`. A mismatch fails as
+`AADSTS70021: No matching federated identity record found` — which is the failure
+mode you want, because it proves the trust really is that narrow.
 
-### 2. Two app registrations, split by blast radius
+**This control has been exercised, and it refused a deploy.** The first pipeline
+run failed at the deploy job with exactly that error. The credential had been
+created for `repo:Alhamwis/OpsBridge365:ref:refs/heads/main`, but the deploy job
+is gated on the `production` GitHub environment, and **an environment-gated job
+gets a subject of `environment:<name>`, not `ref:<branch>`** — the branch does not
+appear in the subject at all. The credential was replaced with the
+environment-scoped one; the workflow has not been re-run since, so no successful
+deploy exists yet. `DEPLOYMENT.md` documents the subject rule in full, because it
+is the single most likely thing to bite someone reproducing this.
+
+Worth naming plainly: this is what a narrow trust boundary looks like from the
+inside. A credential scoped `repo:*` or issued as a client secret would have
+deployed on the first attempt, and would have been the weaker configuration.
+
+### 2. Two app registrations, split by blast radius — **implemented**
 
 This is the central security decision, and merging the two "for convenience" would
-undo it.
+undo it. Both app registrations now exist, in two different tenants, and the table
+below describes what they actually hold — not what they are designed to hold.
 
 | | `opsbridge-deploy` | `opsbridge-graph` |
 | --- | --- | --- |
-| Authenticates with | OIDC federated credential | A client secret |
-| Has a stored password? | **No. Never** | Yes — the only one in the system |
-| Azure RBAC | Contributor + User Access Administrator, **resource-group scope only** | **None at all** |
-| Graph permissions | **None** | Application permissions only |
+| Tenant | The one that owns the Azure subscription | The Microsoft 365 tenant that owns the data |
+| Authenticates with | One OIDC federated credential | A client secret |
+| Has a stored password? | **No. Zero passwords, zero certificates** — verified by reading its credential list back | Yes — the only one in the system |
+| Azure RBAC | Contributor + Role Based Access Control Administrator, **resource-group scope only** | **None at all** |
+| Graph permissions | **None** | Three application permissions, admin-consented; **zero delegated grants** |
 | Used by | `azure/login@v2` | The containers, via Key Vault |
 
-The identity that has ARM authority has no credential to leak. The credential that
-can leak has no ARM authority. One merged app would mean a long-lived Graph secret
-attached to a principal that can also deploy to the resource group — leak it and
-the attacker gets Azure, not just Graph read access.
+**The property that matters is verified, not merely intended: the deploy identity
+has no credential of any kind.** Not a weak one, not a rotated one — none. There
+is nothing on that principal for an attacker to steal, phish or find in a log,
+because the only way to authenticate as it is to be GitHub Actions running this
+repository's `production` environment. The identity that has ARM authority has no
+credential to leak; the credential that can leak has no ARM authority.
 
-Note the deploy identity needs **User Access Administrator** (or the narrower
-Role Based Access Control Administrator) only because `main.bicep` creates the
-Key Vault role assignment for the container identity. That is a real privilege and
-it is worth knowing it is there; it is scoped to one resource group, never the
+One merged app would mean a long-lived Graph secret attached to a principal that
+can also deploy to the resource group — leak it and the attacker gets Azure, not
+just Graph read access.
+
+The deploy identity holds **Role Based Access Control Administrator** (the narrow
+substitute for User Access Administrator) for exactly one reason: `main.bicep`
+creates the Key Vault Secrets User assignment for the container identity, and
+Contributor cannot create role assignments. That is a real privilege and it is
+worth knowing it is there. It is scoped to the resource group, never the
 subscription.
+
+Consent for `opsbridge-graph` was granted **programmatically**, by creating
+`appRoleAssignments` on the service principal rather than by clicking through the
+portal, and then **verified by reading the consent state back**. That matters for
+two reasons: the grant is reproducible and reviewable as code rather than as a
+remembered click, and reading it back is what distinguishes "consent was
+requested" from "consent exists".
+
+### 2a. The bootstrap app — a privilege escalation, documented and reversed
+
+`Sites.Selected` with the `write` role **cannot create SharePoint lists.** It can
+read and PATCH items on a granted site; creating the list schema in the first
+place needs a site-level administrative permission. This was an open expectation
+in an earlier revision of this document; it is now a finding.
+
+Rather than raise the runtime identity's permissions to cover a one-time
+provisioning step — the obvious and wrong shortcut — a separate throwaway app,
+`opsbridge-bootstrap`, was registered with `Sites.FullControl.All`, used to create
+the `Assets` and `Tickets` schema, and then **deleted**.
+
+| | What happened |
+| --- | --- |
+| Who held `Sites.FullControl.All` | `opsbridge-bootstrap`, and only it |
+| For how long | Long enough to create two list schemas |
+| What holds it now | Nothing. The app registration is deleted |
+| What the runtime identity ever held | `Sites.Selected` with `write` on one site. **It never held FullControl** |
+
+The security property is the reversal, not the restraint. A tenant-wide SharePoint
+write permission existed for a bounded window, was used for one purpose, and was
+removed by deleting the principal that held it — which is stronger than removing
+the permission, because it also removes the credential and the service principal.
+The alternative shortcut would have left `Sites.FullControl.All` permanently
+attached to the identity whose secret sits in Key Vault and runs on a cron, which
+would have made the entire `Sites.Selected` argument in §4 decorative.
+
+Stated as a rule: **a permission needed once should be held by a principal that
+exists once.** The provisioning script is idempotent (a re-run reports 13 EXISTS /
+0 CREATED), so re-creating a bootstrap app for a future schema change is a
+deliberate, visible act rather than standing authority.
 
 ### 3. The one secret lives in Key Vault
 
@@ -178,13 +248,14 @@ permission *and* an Intune licence, neither of which is in scope.
 > app looked correctly configured. Replaced with `Device.Read.All` throughout;
 > the table above always matched the code.
 
-One honest caveat remains:
-
-- **`Sites.Selected` with the `write` role covers the sync job's runtime needs**
-  (read items, PATCH items). `scripts/provision_sharepoint.py` additionally
-  *creates lists and columns*, which may require a higher site role (`manage` or
-  `fullControl`) or a one-time run under an admin context. This has not been
-  tested against a real tenant, so it is stated as an expectation, not a fact.
+**The caveat that used to be here has been resolved.** An earlier revision said
+that `Sites.Selected` with `write` "may" be insufficient for
+`scripts/provision_sharepoint.py` to create lists and columns, and stated it as an
+expectation. It is now a fact: `write` covers the sync job's runtime needs (read
+items, PATCH items) and **cannot create lists**. The list schema was created by
+the throwaway `opsbridge-bootstrap` app described in [§2a](#2a-the-bootstrap-app--a-privilege-escalation-documented-and-reversed),
+which was deleted afterwards. The runtime identity's permission set was not
+widened to accommodate a one-time step.
 
 ### 5. Container hardening
 
@@ -245,16 +316,27 @@ Both `ci.yml` and `deploy.yml` run a `secret-scan` job
   declares `needs: [secret-scan, test]`, so a finding stops the run before an
   image is pushed to ghcr.io and therefore before anything can reach Azure.
 - **A minimal allowlist.** `.gitleaks.toml` extends the default ruleset
-  (`useDefault = true`, nothing disabled) and allowlists exactly one value: the
-  Azure built-in role definition GUID for *Key Vault Secrets User* in
-  `infra/main.bicep`, which is a fixed public identifier Microsoft publishes and
-  is identical in every tenant. It is matched by exact value, so any other
-  high-entropy string still fails the build. `.env.example` and
+  (`useDefault = true`, nothing disabled) and allowlists seven values, each
+  **by exact value, never by pattern**: four Azure built-in role definition GUIDs
+  (Key Vault Secrets User, Contributor, Role Based Access Control Administrator,
+  User Access Administrator) and the three Microsoft Graph app-role ids for
+  `User.Read.All`, `Device.Read.All` and `Sites.Selected`. Every one is a fixed
+  public identifier Microsoft publishes, identical in every tenant, granting
+  nothing on its own — but each looks like a high-entropy string to the generic
+  key rule. Matching by exact value means a real 36-character credential that
+  merely *looks* like a GUID still fails the build. `.env.example` and
   `infra/main.parameters.example.json` are **not** allowlisted — they scan clean
   on their own merits and must keep being scanned.
 
-Run against this repository's full history (gitleaks v8.30.1, 6 commits), the
-only finding is that role GUID; with the allowlist in place the scan is clean.
+**This job now runs on GitHub and passes.** In Actions run `32113268465` the
+`secret scan (gitleaks)` job reported SUCCESS over the full history, alongside a
+SUCCESS on `test`; `build and push to ghcr.io` ran only because both gates
+cleared. It is no longer a locally-verified control.
+
+A separate manual disclosure review ran before the repository was made public:
+zero real tenant, subscription, app, site or list identifiers in the working tree
+**or in any commit in the history**. That review is why identifiers appear nowhere
+in these documents — names and roles only.
 
 ### 7. The application does not leak configuration to callers
 
@@ -305,15 +387,15 @@ against it — see [`COST.md`](COST.md).
 
 | Attack | What stops it |
 | --- | --- |
-| **Pull the public image and extract credentials** | There are none. Configuration arrives as environment variables at runtime; no `.env` or credential-bearing `ARG`/`ENV` is in the image (verified) |
+| **Pull the published image and extract credentials** | There are none. Configuration arrives as environment variables at runtime; no `.env` or credential-bearing `ARG`/`ENV` is in the image (verified). The image is designed to be safe when public, which is what makes the pending visibility change a non-event |
 | **Steal the Graph client secret from the repo** | It was never committable — `.gitignore` was the first commit. It exists only in a GitHub Actions secret and in Key Vault |
 | **Steal it from the deployed app's configuration** | It is a Key Vault reference, not a stored value. Reading it needs the managed identity, which only Container Apps can assume |
 | **Steal it from deployment outputs or logs** | `@secure()` keeps it out of ARM history; no output emits a secret; no workflow step echoes one |
 | **Use the leaked Graph secret to attack Azure** | That app registration holds **no Azure RBAC at all**. It gets Graph read access plus write to one SharePoint site — nothing in ARM |
 | **Use the leaked Graph secret to attack the wider tenant** | Permissions are read-only on users and devices; SharePoint write is `Sites.Selected`, scoped to one site |
-| **Steal the Azure deploy credential** | There isn't one. OIDC tokens are minted per run and expire with the job |
+| **Steal the Azure deploy credential** | There isn't one — verified, not assumed: `opsbridge-deploy` holds zero passwords and zero certificates. OIDC tokens are minted per run and expire with the job |
 | **Open a malicious PR to run code with secrets** | `ci.yml` has `contents: read` and no secrets, no registry login, no cloud login |
-| **Push to a side branch to deploy a backdoored image** | Deploy requires `refs/heads/main` **and** the `production` environment; the federated credential's subject is pinned to those |
+| **Push to a side branch to deploy a backdoored image** | Deploy requires `refs/heads/main` **and** the `production` environment. The single federated credential's subject is `repo:Alhamwis/OpsBridge365:environment:production` — a token from any other context is refused by Entra, which is exactly how the first deploy attempt failed |
 | **Escalate inside the container** | Non-root uid 10001, no writable application filesystem, no shell tooling beyond the base image, no compiler |
 | **Hit `/metrics` to enumerate configuration** | Responses are generic; nothing echoes a variable name, tenant id or secret |
 | **Throttle or DoS the API to run up a bill** | `maxReplicas: 1`, plus the Container Apps free grant; job timeout capped at 30 minutes |
@@ -325,11 +407,15 @@ against it — see [`COST.md`](COST.md).
 
 Stated plainly, because a security document that only lists wins is marketing.
 
-- **GitHub's own push protection is not enabled** — it cannot be until the
-  repository exists on GitHub. Repo-side secret scanning *is* now in the pipeline
-  (see below), but push protection blocks a secret before it is ever committed,
-  which is strictly better, and it is a two-click setting to turn on once the
-  repo is pushed.
+- **GitHub's own push protection is not enabled.** The repository is now public,
+  so this is available and is a two-click setting — it simply has not been turned
+  on. The gitleaks job catches a committed secret; push protection blocks one
+  before it is ever committed, which is strictly better.
+- **The GHCR package is private.** The image is published but anonymous
+  `docker pull` returns `unauthorized`. This is not a security control — it is an
+  unfinished step that will *block* the deploy, since a public package is what
+  lets Container Apps pull with no registry credential at all. GitHub exposes no
+  REST API for container package visibility; it is a UI-only setting.
 - **No dependency or container scanning.** No Dependabot, no CodeQL, no Trivy
   image scan. Dependencies are floor-pinned (`>=`) rather than lock-filed, so a
   build is not byte-reproducible.
@@ -341,7 +427,13 @@ Stated plainly, because a security document that only lists wins is marketing.
 - **Key Vault allows public network access** with `defaultAction: Allow`. Private
   endpoints and a firewall are the production answer; both cost money and neither
   is in the free tier.
-- **No control has been verified in Azure.** Every claim about OIDC, Key Vault
-  references, role scoping and ingress is a claim about the committed template and
-  workflow, verified by reading and by `bicep build`, not by a deployment. The
-  container and application controls *have* been verified by running them locally.
+- **No control inside `infra/main.bicep` has been verified in Azure.** Key Vault,
+  the Key Vault reference, the managed identity's single scoped role assignment
+  and HTTPS-only ingress are claims about a template that compiles, not about a
+  deployment — none of those resources exist. What *has* been verified in Azure is
+  the surrounding identity layer: the resource group, the deploy app's zero
+  credentials, and its two role assignments at resource-group scope.
+- **The deploy pipeline has never completed successfully.** Three of four jobs
+  pass; the deploy job failed on the OIDC subject mismatch in §1 and has not been
+  re-run since the credential was corrected. Until it does, "OIDC deploys this"
+  remains a design claim with one recorded failure and no recorded success.
