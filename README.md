@@ -169,7 +169,7 @@ looking good.
 
 | Component | Status | How that is known |
 | --- | --- | --- |
-| Graph client — auth, paging, 429/503 retry with `Retry-After` | ✅ **Implemented + tested locally** | 57 tests pass offline; `tests/test_graph.py` covers paging, throttling, timeout, malformed JSON |
+| Graph client — auth, paging, 429/503 retry with `Retry-After` | ✅ **Implemented + tested locally** | 58 tests pass offline; `tests/test_graph.py` covers paging, throttling, timeout, malformed JSON |
 | SharePoint client — list reads, asset PATCH | ✅ **Implemented + tested locally** | `tests/test_sharepoint.py` asserts the PATCH payload shape |
 | Sync job (`python -m app.sync`) | ✅ **Implemented + tested locally** | `tests/test_sync.py`: ambiguous keys match nothing, unresolved values become `"Unknown"` |
 | SLA metrics computation | ✅ **Implemented + tested locally** | `tests/test_metrics.py`: zero denominator returns `null`, not a fake percentage |
