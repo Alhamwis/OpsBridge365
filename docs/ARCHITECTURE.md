@@ -2,15 +2,17 @@
 
 How OpsBridge365's cloud layer is put together, and why each choice was made.
 
-> **The topology below is real; the Azure compute in it is not deployed.** Both
-> tenants exist, both app registrations exist, the SharePoint site and both lists
-> exist, and the container image is published. **No resource declared in
-> `infra/main.bicep` exists** — no Log Analytics workspace, no Container Apps
-> environment, no Key Vault, no managed identity, no Job, no API. The template
-> compiles and the container runs locally; neither has been submitted to ARM. See
-> the status table in the [README](../README.md#status). This document describes
-> the design in the present tense; where it names an Azure resource, read that as
-> "declared", not "running".
+> **The topology below is real, and it is running.** Every resource declared in
+> `infra/main.bicep` exists in `rg-opsbridge365` (westus2) — Log Analytics
+> `opsbridge-logs`, the user-assigned identity `opsbridge-id`, Key Vault, the
+> Container Apps environment `opsbridge-env`, the `opsbridge-sync` Job and the
+> `opsbridge-api` App — deployed by GitHub Actions run `32115509179`. The API is
+> public at
+> `https://opsbridge-api.purplewave-d90933e8.westus2.azurecontainerapps.io`, and
+> the sync job has executed on its cron and written a live SharePoint list. So
+> where this document names an Azure resource in the present tense, that is
+> literal. See the [status table](../README.md#status) for what was measured, and
+> the gaps beneath it for what was not.
 
 ---
 

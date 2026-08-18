@@ -2,19 +2,23 @@
 
 What this architecture is expected to cost, why, and what would break that.
 
-> **Observed spend so far: $0.00 — and that number means less than it looks.**
-> The subscription is real, the resource group `rg-opsbridge365` exists, and a
-> budget guards it. But **no billable resource is deployed**: nothing from
-> `infra/main.bicep` has ever been submitted to ARM, so there is no Container Apps
-> environment, no Key Vault and no Log Analytics workspace to bill for. $0.00 is
-> what an empty resource group costs. It is not yet evidence that the *running*
-> architecture costs nothing.
+> **Observed spend to date: $0.00 — against a deployment that is actually
+> running.** Log Analytics, Key Vault, the Container Apps environment, the sync
+> Job and the API all exist in `rg-opsbridge365`, the job has executed, and the
+> API has served requests. The **idle replica count was observed at 0**, which is
+> the mechanism the whole figure rests on.
 >
-> Everything below is therefore still derived from the resource configuration in
-> `infra/main.bicep` and published Azure pricing, not from a Cost Management
-> export of a running system. `evidence/cost/` stays empty until something runs.
-> Prices are list rates at time of writing, quoted for the *shape* of the bill;
-> they change, and they vary by region.
+> **The honest caveat: $0.00 partly reflects a subscription only hours old.**
+> Azure bills on accumulated usage, and almost none has accumulated. A number
+> this clean, this early, is consistent with a well-designed architecture and
+> equally consistent with one that has not been running long enough to show up in
+> a bill. What would settle it is a full billing cycle at this configuration, and
+> that has not happened.
+>
+> So: the *architecture* is deployed and measured; the *cost* is deployed and
+> barely sampled. The per-line arithmetic below is still arithmetic over
+> published pricing. Prices are list rates at time of writing, quoted for the
+> shape of the bill; they change, and they vary by region.
 
 **Expected steady state: $0.00/month**, under the assumptions listed below. Not
 "free forever" — free *given these assumptions*, each of which can stop being
@@ -27,7 +31,7 @@ true.
 | Resource | Pricing model | Expected | Why |
 | --- | --- | --- | --- |
 | Container Apps **Job** (`opsbridge-sync`) | Per vCPU-second and GiB-second of replica life | **$0** | Billed only while a replica is alive. See the math below — the monthly draw is well under 1% of the free grant |
-| Container **App** (`opsbridge-api`) | Same, plus per-request | **$0** | `minReplicas: 0`. No replica, no bill. An idle month is genuinely zero, not rounded to zero |
+| Container **App** (`opsbridge-api`) | Same, plus per-request | **$0** | `minReplicas: 0`, and the **idle replica count was observed at 0**. No replica, no bill. An idle month is genuinely zero, not rounded to zero. The price is paid in latency instead: **714 ms** cold from zero replicas, **143 ms** warm |
 | Container Apps **environment** | — | **$0** | The environment itself is not billed. You pay for replica seconds |
 | **Log Analytics** workspace | Per GB ingested (~$2.76/GB beyond the free tier) | **$0** | 5 GB/month ingestion is free. This workload emits kilobytes: a few log lines per sync, a request line per API call |
 | Log Analytics **retention** | Per GB-month beyond 31 days | **$0** | `retentionInDays: 30` — deliberately inside the free 31-day window |
@@ -84,12 +88,10 @@ State them, because "free" without assumptions is a sales claim.
    `DEBUG` log level in production, or a much larger device fleet all move real
    volume. The application logs at `INFO` and truncates Graph error bodies to 500
    characters, which is a deliberate part of this.
-5. **The GHCR package is public.** Stated as an assumption because it is
-   **currently false**: the package is published but private, so anonymous
-   `docker pull` returns `unauthorized`. Until it is made public, Container Apps
-   cannot pull it without registry credentials — which would mean a registry
-   secret in Key Vault, or ACR, which has no free tier. This is a pending step,
-   not a design change; see [`DEPLOYMENT.md`](DEPLOYMENT.md).
+5. **The GHCR package stays public.** ✅ It is, and Container Apps pulled from it
+   with no registry credential in run `32115509179`. Make it private and
+   Container Apps needs registry credentials — which means a registry secret in
+   Key Vault, or ACR, which has no free tier.
 6. **The device and ticket lists stay small.** The sync pages through *all* users
    and *all* devices on every run. At tens of devices that is seconds; at tens of
    thousands it is minutes of replica time per run, plus Graph throttling and the
@@ -123,16 +125,14 @@ State them, because "free" without assumptions is a sales claim.
 
 ## Guardrails
 
-Four exist. Three are in the template and unexercised; the fourth is **live in
-Azure right now**, and it is the only one of the four that does not depend on a
-deployment.
+Four, and **all four are now live in Azure** rather than declared in a template.
 
 | # | Guardrail | State |
 | --- | --- | --- |
-| 1 | **`replicaTimeout: 1800`** on the sync job — a hung Graph call is killed at 30 minutes and cannot bill indefinitely | In `main.bicep`; not deployed |
-| 2 | **`replicaRetryLimit: 1`** — a failing sync retries once and then waits for the next cron tick, instead of looping on a Graph outage and burning free-grant seconds | In `main.bicep`; not deployed |
-| 3 | **`maxReplicas: 1`** on the API — caps what traffic can spend | In `main.bicep`; not deployed |
-| 4 | **Budget `opsbridge-monthly-20`** — $20/month, scoped to the resource group, alerting at **50% and 90% of actual** and **100% forecasted** | ✅ **Live.** Current spend $0.00 |
+| 1 | **`replicaTimeout: 1800`** on the sync job — a hung Graph call is killed at 30 minutes and cannot bill indefinitely | ✅ Deployed on `opsbridge-sync` |
+| 2 | **`replicaRetryLimit: 1`** — a failing sync retries once and then waits for the next cron tick, instead of looping on a Graph outage and burning free-grant seconds | ✅ Deployed on `opsbridge-sync` |
+| 3 | **`maxReplicas: 1`** on the API — caps what traffic can spend | ✅ Deployed on `opsbridge-api` (cpu 0.25 / memory 0.5Gi) |
+| 4 | **Budget `opsbridge-monthly-20`** — $20/month, scoped to the resource group, alerting at **50% and 90% of actual** and **100% forecasted** | ✅ **Live**, and it predates every resource above. Current spend $0.00 |
 
 The budget deliberately came *first*, before any resource that could spend money.
 A cost guardrail created after the workload it guards has already had a window in
@@ -166,8 +166,13 @@ retention set inside the free window. Every one of those was a decision with a
 stated trade-off — cold starts, no in-process state, a public image.
 
 What it does *not* mean: it is not free at production scale, it is not free with a
-polled dashboard, and **it has not been measured.** The $0.00 currently showing in
-Cost Management is the cost of an empty resource group, not of a running system.
-The first bill from an actually-deployed Container Apps environment is the only
-thing that would turn these numbers from arithmetic into evidence — and the $20
-budget is already in place to catch it if the arithmetic is wrong.
+polled dashboard, and **it has not been measured over time.** The $0.00 in Cost
+Management is now the cost of a *running* system rather than an empty resource
+group — which is a real improvement on the previous claim — but it covers hours,
+not a billing cycle. A full month at this configuration is the only thing that
+turns these numbers from arithmetic into evidence, and the $20 budget is already
+in place to catch it if the arithmetic is wrong.
+
+The one number here that is genuinely measured rather than modelled is the cost
+of scaling to zero, and it is not money at all: **714 ms** on the first request
+after idle, against **143 ms** warm. That 571 ms is the whole bill.

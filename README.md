@@ -6,18 +6,22 @@ pulls users and devices from Microsoft Graph and writes them into a SharePoint
 SLA numbers. It is packaged as one container image with two entrypoints, deployed
 by one Bicep template, and designed to cost nothing while idle.
 
-> **Deployment status, stated up front.** The accounts are real and the data plane
-> is live; the Azure compute is not deployed. Concretely: the repository is public,
-> its pipeline runs, and it publishes a container image to ghcr.io. The Microsoft
-> 365 tenant, the `opsbridge-graph` app registration with three admin-consented
-> application permissions, the SharePoint site and both lists all exist — twelve
-> integration tests pass against them. What does **not** exist is anything
-> `infra/main.bicep` declares: no Log Analytics workspace, no Container Apps
-> environment, no Key Vault, no sync Job, no API. The deploy job has run once and
-> failed on an OIDC subject mismatch; the federated credential has been corrected
-> and the job has not been re-run since. The [status table](#status) puts every
-> component in one of three buckets — live and verified, built but not deployed,
-> not started — and nothing is promoted a bucket for looking good.
+> **Deployment status, stated up front. It is deployed, and it is running.**
+> GitHub Actions run [`32115509179`](#status) was green end to end — test, secret
+> scan, image push, and `deploy to Azure` — through OIDC federation with **no
+> stored Azure credential**. Everything `infra/main.bicep` declares now exists in
+> `rg-opsbridge365` (westus2): Log Analytics, a user-assigned identity, Key Vault,
+> a Container Apps environment, the `opsbridge-sync` Job on a cron, and the
+> `opsbridge-api` App. The API is public and answering:
+>
+> ```
+> https://opsbridge-api.purplewave-d90933e8.westus2.azurecontainerapps.io/healthz
+> ```
+>
+> The sync job has run in the cloud and written a live SharePoint list. The
+> [status table](#status) records what was measured, and the
+> [gaps](#known-gaps--not-done) record what still is not done — including the
+> alert defect that testing found, which is written up rather than quietly fixed.
 
 ---
 
@@ -86,6 +90,20 @@ Full component and data-flow detail, and the reasoning behind each choice, is in
 ---
 
 ## Quickstart
+
+### Call the live API — no credentials, no setup
+
+```bash
+BASE=https://opsbridge-api.purplewave-d90933e8.westus2.azurecontainerapps.io
+
+curl -s "$BASE/healthz"    # {"status":"ok","version":"0.1.0"}
+curl -s "$BASE/metrics"    # live SLA numbers, read from SharePoint
+```
+
+If the first call takes about three quarters of a second and the second is
+instant, that is `minReplicas: 0` doing its job — measured at **714 ms** cold and
+**143 ms** warm. Plain `http://` returns **301**; ingress sets
+`allowInsecure: false`.
 
 ### Run the tests
 
@@ -176,50 +194,86 @@ never PASS — an unauthenticated run tells you exactly what it did *not* verify
 
 ## Status
 
-Three categories. **Live and verified** means it exists and was observed working.
-**Built, not deployed** means the code is written and passes what can be checked
-without the cloud, and nothing of it is running. **Not started** means exactly
-that. Nothing is promoted a category for looking good — in particular, every Azure
-resource `infra/main.bicep` declares is in the middle category, not the first.
+Every row below was observed working against the real thing, and every number in
+it was measured rather than estimated. Where something was *not* measured, it is
+in [Known gaps](#known-gaps--not-done) instead — nothing is promoted for looking
+good.
 
-### ✅ Live and verified
+| Component | Status | Evidence |
+| --- | --- | --- |
+| **CI/CD, push to deploy** | ✅ Live | Actions run **`32115509179`**: `test` SUCCESS, `secret scan (gitleaks)` SUCCESS, `build and push to ghcr.io` SUCCESS, `deploy to Azure` SUCCESS. Full green through **OIDC federation with no stored Azure credential** — [`evidence/github-actions/pipeline.md`](evidence/github-actions/pipeline.md) |
+| **Azure deployment** | ✅ Live | Resource group `rg-opsbridge365` in **westus2**: Log Analytics `opsbridge-logs` (PerGB2018, 30-day retention), user-assigned identity `opsbridge-id`, Key Vault (RBAC-enabled, soft-delete on, standard), Container Apps environment `opsbridge-env`, Job `opsbridge-sync`, App `opsbridge-api` — [`evidence/azure/deployment.md`](evidence/azure/deployment.md) |
+| **Live API** | ✅ Live | `https://opsbridge-api.purplewave-d90933e8.westus2.azurecontainerapps.io` — `/healthz` → **200** `{"status":"ok","version":"0.1.0"}`. **Cold start from zero replicas: 714 ms.** Warm: **143 ms** |
+| **Live SLA metrics** | ✅ Live | `/metrics` → **200**, computed from live SharePoint: `{"open_tickets":2,"due_within_30min":0,"sla_compliance_7d_pct":50.0,"resolved_last_7d":2,"sla_measured_last_7d":2}` |
+| **HTTPS only** | ✅ Verified | `http://` → **301** to `https://`. Ingress `allowInsecure: false` |
+| **Scale to zero** | ✅ Verified | `minReplicas: 0`, `maxReplicas: 1`, cpu 0.25 / memory 0.5Gi. **Idle replica count observed: 0** |
+| **Scheduled sync job** | ✅ Verified | `triggerType: Schedule`, cron `0 */6 * * *`, `replicaRetryLimit: 1`, `replicaTimeout: 1800`. **The schedule was proven, not assumed**: cron was temporarily set to `*/5`, execution `opsbridge-sync-29784065` started at `09:05:00Z` by Azure's scheduler with no human or local involvement and succeeded, then the production cron was restored and read back |
+| **End-to-end reconciliation** | ✅ Verified | The cloud job read Graph and wrote the live Assets list: `users_fetched: 1, devices_fetched: 1, assets_fetched: 4, matched: 1, patched: 1, unknown_last_check_in: 1`. **One confident match written, three honest `Unknown`s** — [`evidence/sharepoint/reconciliation.md`](evidence/sharepoint/reconciliation.md) |
+| **Secret handling** | ✅ Verified | Container App secret `graph-client-secret` is a **Key Vault reference** (`keyVaultUrl` set, **no inline value**); `AZURE_CLIENT_SECRET` reaches the container as a `secretRef`. Deployment outputs are exactly `apiFqdn, identityPrincipalId, jobName, keyVaultName, logAnalyticsWorkspaceId` — **no secret** |
+| **Least privilege, demonstrated** | ✅ Verified | Key Vault denies the **human operator** with **`ForbiddenByRbac`**. Only the managed identity holds Key Vault Secrets User — [`evidence/security/posture.md`](evidence/security/posture.md) |
+| **Log Analytics** | ✅ Live | Captured the cloud job's summary from a container that no longer exists |
+| **Failure alerting** | ✅ Live, and it found a defect | Action group `opsbridge-alerts` + scheduled query rule `opsbridge-sync-failed` (severity 2, 5-min evaluation, 15-min window). Tested with a **controlled failure**; the first version of the query returned **0 hits against a genuinely failed job**. Corrected query returns **2** — [`evidence/monitoring/alerting.md`](evidence/monitoring/alerting.md) |
+| **Cost** | ✅ Verified | Observed spend **$0.00**. Budget `opsbridge-monthly-20` at $20/month, alerts at 50%/90% actual and 100% forecasted, **created before any billable resource** — [`evidence/cost/observed.md`](evidence/cost/observed.md) |
+| **Offline test suite** | ✅ Verified | **58 passed**, integration deselected, no credentials and no network |
+| **Live integration suite** | ✅ Verified | **12 passed** against the real tenant — Graph auth, paging, the Assets PATCH round trip and the `Sites.Selected` boundary — [`evidence/graph/live-integration-run.md`](evidence/graph/live-integration-run.md) |
+| **Container image** | ✅ Live | `ghcr.io/alhamwis/opsbridge365`, public, pulled by Container Apps with **no registry credential**. Multi-stage, non-root uid 10001 — [`evidence/docker/build-and-run.md`](evidence/docker/build-and-run.md) |
+| **Secret scanning** | ✅ Live | gitleaks over the **full history** (`fetch-depth: 0`), hard gate on `build-and-push`, no `continue-on-error`. Allowlist holds 7 public Microsoft GUIDs, matched **by exact value only** |
+| **Deploy identity `opsbridge-deploy`** | ✅ Verified | Zero passwords, zero certificates, zero Graph permissions — one federated credential, subject `repo:Alhamwis@<ownerId>/OpsBridge365@<repoId>:environment:production`. RBAC is Contributor + Role Based Access Control Administrator, **resource-group scope only** |
+| **Graph identity `opsbridge-graph`** | ✅ Verified | Exactly three admin-consented **application** permissions — `User.Read.All`, `Device.Read.All`, `Sites.Selected` — zero delegated grants. Consent granted programmatically via `appRoleAssignments`, then read back |
+| **`Sites.Selected` boundary** | ✅ Verified | Role `write` on **one** site. Ungranted-site *data* → 403, tenant-wide enumeration → 403, ungranted-site *metadata* → 200 (expected Microsoft behaviour, documented rather than overclaimed) |
+| **SharePoint `Assets` / `Tickets`** | ✅ Live | Provisioned and seeded with 4 synthetic rows each. A second provisioning run reported **13 EXISTS / 0 CREATED** |
+| **Public repository** | ✅ Live | [`github.com/Alhamwis/OpsBridge365`](https://github.com/Alhamwis/OpsBridge365). Root commit `50f92b7` is `.gitignore` alone, so no secret could predate it. A disclosure review passed before it went public |
 
-| Component | Evidence |
+### ⚠️ One dated action, not automatable
+
+The Microsoft 365 tenant runs on an **O365_BUSINESS_PREMIUM trial** — Microsoft Graph reports
+`isTrial: true`, created **2026-08-18**, with `nextLifecycleDateTime` of **2026-09-16** and 25
+licences. Before that date, turn off recurring billing in the Microsoft 365 admin center
+(*Billing → Your products*), or it converts to paid. Microsoft exposes no supported Graph or CLI
+API for this, so it cannot be scripted.
+
+Turning off renewal does **not** tear anything down immediately — the tenant, the SharePoint site
+and the Graph identity keep working until the trial period ends. The Azure side is unaffected: it
+lives in a different tenant and costs $0.00.
+
+### Known gaps — not done
+
+| Gap | Why it matters |
 | --- | --- |
-| Public GitHub repository, default branch `main` | [`github.com/Alhamwis/OpsBridge365`](https://github.com/Alhamwis/OpsBridge365). A disclosure review ran before it went public: zero real tenant, subscription or app identifiers in the working tree or anywhere in the commit history |
-| Offline test suite | **58 passed**, integration deselected, no credentials and no network needed |
-| Live integration suite against the real tenant | **12 passed** — [`evidence/graph/live-integration-run.md`](evidence/graph/live-integration-run.md). These exercise Graph auth, paging, the Assets read/PATCH round trip and the `Sites.Selected` boundary against real Microsoft Graph |
-| CI `test` job on GitHub Actions | Run `32113268465` — **SUCCESS** |
-| Secret scanning (gitleaks, full history) job | Run `32113268465` — **SUCCESS**. Hard gate on `build-and-push`, no `continue-on-error` |
-| Container image build and push to ghcr.io | Run `32113268465` — **SUCCESS**. Published as `ghcr.io/alhamwis/opsbridge365:latest` and `:8954c91018c24774705672d146554f7c788aad32` |
-| Container image, locally | Multi-stage, non-root uid 10001, `/healthz` 200 with an empty environment — [`evidence/docker/build-and-run.md`](evidence/docker/build-and-run.md) |
-| Azure resource group `rg-opsbridge365` (`eastus`) | Created. **Empty** — it holds no resources from `main.bicep` |
-| Deploy identity `opsbridge-deploy` | Created. Zero passwords, zero certificates, zero Graph permissions — federated OIDC only. RBAC is Contributor + Role Based Access Control Administrator, **both scoped to the resource group only**. RBAC Administrator is needed because Contributor cannot create the Key Vault Secrets User assignment in `main.bicep` |
-| Budget guardrail `opsbridge-monthly-20` | $20/month on the resource group, alerts at 50% and 90% actual and 100% forecasted. Observed spend **$0.00** |
-| Microsoft 365 tenant with SharePoint | M365 Business Standard, SharePoint provisioned |
-| Graph identity `opsbridge-graph` | Created, holding exactly three admin-consented **application** permissions — `User.Read.All`, `Device.Read.All`, `Sites.Selected` — and zero delegated grants. Consent was granted programmatically via `appRoleAssignments`, then verified by reading the consent state back |
-| `Sites.Selected` site-scoped grant | Role `write` on **one** site, `https://opsbridge365.sharepoint.com/sites/opsbridge365ops`. The boundary was then probed with the app's own token; results in [`docs/SECURITY.md`](docs/SECURITY.md#what-sitesselected-does-and-does-not-hide) |
-| SharePoint `Assets` and `Tickets` lists | Provisioned by `scripts/provision_sharepoint.py`, each seeded with 4 synthetic rows. A second run reported **13 EXISTS / 0 CREATED**, which is the idempotency claim actually tested rather than asserted |
-| Bootstrap privilege, granted and reversed | A throwaway `opsbridge-bootstrap` app held `Sites.FullControl.All` only long enough to create the list schema — `Sites.Selected` `write` cannot create lists — and was then **deleted**. The runtime identity never held FullControl |
+| **Cost is not proven over a billing cycle** | `$0.00` is real, and it partly reflects a subscription only hours old. Expected steady state is $0.00/month on the assumptions in [`docs/COST.md`](docs/COST.md); one full month at this configuration is what would turn arithmetic into evidence |
+| **The end-to-end run was one user and one device** | The matching and paging rules are covered by offline tests, but nothing here has met a real fleet, real Graph throttling at volume, or a large list |
+| **No load, throughput or uptime figure** | One cold request and one warm request were measured. That is a latency data point, not a performance characterisation, and the deployment is hours old |
+| **`/metrics` is unauthenticated** | Public by design for a demo. It exposes counts and a percentage — no ticket contents, no personal data — and would not be acceptable in production |
+| **No dependency or image scanning** | No Dependabot, no CodeQL, no Trivy. Secret scanning *is* implemented and gating. GitHub push protection is still off |
+| **Key Vault allows public network access** | Private endpoints and a vault firewall are the production answer; neither is free |
+| **Teardown never exercised** | `destroy-cloud.ps1` is written and preflight-checked, and has not been run against the live resource group |
 
-### 🟡 Built, not deployed
+### How it got here — four real failures
 
-| Component | State, and what it waits on |
-| --- | --- |
-| Every Azure resource in `infra/main.bicep` — Log Analytics, Container Apps environment, Key Vault, managed identity, the `opsbridge-sync` Job, the `opsbridge-api` App | **None of these exist.** The template compiles clean (Bicep CLI 0.46.1, zero diagnostics) but has never been submitted to ARM — not even `--what-if`. Waiting on a successful `deploy` job |
-| `deploy.yml` deploy job | **Has run once and failed.** The cause was an OIDC subject mismatch: the job is environment-gated, so GitHub presents `repo:Alhamwis/OpsBridge365:environment:production`, while the federated credential matched `...:ref:refs/heads/main`. The app now carries exactly one federated credential, the environment-scoped one. Waiting on a re-run |
-| GHCR package visibility | The image is published but the package is **private** — anonymous `docker pull` returns `unauthorized`. Container Apps pulls with no registry credentials only from a public package. Waiting on a UI-only visibility change; GitHub exposes no REST API for it |
-| Operator scripts `deploy-opsbridge.ps1`, `destroy-cloud.ps1` | Written, preflight-checked, never run against Azure. `verify-opsbridge.ps1` does run end to end today and reports the cloud checks as SKIP |
-| API and sync job as *running workloads* | Both are tested offline, both run in a local container, neither has ever run in Azure. Waiting on the deploy |
+The deploy did not work first time. Three earlier runs failed for three
+genuinely different reasons, none of them a code defect, and each is written up
+with its fix in
+[`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md#things-that-will-bite-you):
 
-### ⛔ Not started
+1. **`AADSTS700213`** — the deploy job is environment-gated, so GitHub presents
+   `...:environment:production`, not `...:ref:refs/heads/main`.
+2. **`AADSTS700213` again** — this account's GitHub default subject is
+   **ID-qualified**: `repo:Alhamwis@<ownerId>/OpsBridge365@<repoId>:environment:production`.
+   `use_default` was already `true`, so there was nothing to normalise; Entra has
+   to match the ID-qualified string. That form is rename-proof, which is a
+   security improvement rather than a workaround.
+3. **`RequestDisallowedByAzure`** — Azure for Students enforces an allowed-regions
+   policy. Permitted: `northcentralus`, `mexicocentral`, `westus2`, `westus`,
+   `canadacentral`. **`eastus` is not allowed.** The resource group was recreated
+   in `westus2`.
+4. **`MissingSubscriptionRegistration`** — `Microsoft.App`, `Microsoft.KeyVault`,
+   `Microsoft.OperationalInsights`, `Microsoft.ManagedIdentity` and
+   `Microsoft.Insights` were all unregistered on a fresh subscription.
 
-| Component | Why |
-| --- | --- |
-| Log Analytics failure alert | Needs a deployed workspace to attach to |
-| Evidence for `evidence/azure/`, `evidence/monitoring/`, `evidence/sharepoint/`, `evidence/cost/` | Nothing has been deployed to capture. `evidence/docker/` and `evidence/graph/` are populated; the rest are empty on purpose |
-| Dependency and container image scanning | No Dependabot, no CodeQL, no Trivy — see [`docs/SECURITY.md`](docs/SECURITY.md) Gaps |
-| Authentication in front of `/metrics` | Public and unauthenticated by design for a demo; not acceptable for a real deployment |
+`bicep build` returned zero diagnostics throughout. The template was never the
+problem — every failure lived between the repository and one specific real
+subscription, which is the argument for deploying rather than reasoning about
+deploying.
 
 **Test suite, re-run independently:**
 
@@ -231,11 +285,10 @@ $ python -m pytest -m integration -q      # credentials in the environment
 12 passed, 58 deselected in 10.06s
 ```
 
-What this table still does **not** claim: there is no measured cold start, uptime
-or throughput figure anywhere in this repository, because nothing has run in Azure
-to measure. The cost figures in [`docs/COST.md`](docs/COST.md) are arithmetic over
-published pricing; the only observed number is $0.00, which is what an empty
-resource group costs.
+One thing the table above deliberately does not do is treat `$0.00` as settled.
+It is an observed number against a subscription only hours old; the expected
+steady state and everything that would break it are in
+[`docs/COST.md`](docs/COST.md).
 
 ---
 
@@ -285,9 +338,9 @@ Dockerfile              multi-stage, non-root, HEALTHCHECK
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, data flow, the two-tenant split, job-vs-API and GHCR-vs-ACR decisions |
 | [`docs/SECURITY.md`](docs/SECURITY.md) | Threat model, controls, Graph permissions, and the gaps |
 | [`docs/COST.md`](docs/COST.md) | The $0-while-idle model, its assumptions, and what breaks it |
-| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | End-to-end runbook, secrets table, the human steps |
+| [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) | End-to-end runbook, secrets table, and **[things that will bite you](docs/DEPLOYMENT.md#things-that-will-bite-you)** — the four real deploy failures and their fixes |
 | [`docs/DEMO.md`](docs/DEMO.md) | A 5-minute interview demo, with an offline fallback |
-| [`docs/EVIDENCE.md`](docs/EVIDENCE.md) | What has been proven, how, and what has not |
+| [`docs/EVIDENCE.md`](docs/EVIDENCE.md) | Index of the nine files under `evidence/` — what was proven, how, and what has not been |
 | [`docs/INTERVIEW-NOTES.md`](docs/INTERVIEW-NOTES.md) | Likely questions and honest answers |
 | [`infra/README.md`](infra/README.md) | Per-resource breakdown of the Bicep template |
 | [`docs/SPEC-cloud-v2-AUTHORITATIVE.md`](docs/SPEC-cloud-v2-AUTHORITATIVE.md) | The design brief this was built against |

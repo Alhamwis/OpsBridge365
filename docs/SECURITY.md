@@ -5,18 +5,19 @@ Threat model and controls for the OpsBridge365 cloud layer.
 > **Scope note.** A control that is designed and committed is not the same as a
 > control that has been observed working, and this document marks which is which.
 >
-> **Observed working:** the two-app identity split (both apps exist; the deploy
-> identity provably holds no credential of any kind), the least-privilege Graph
-> permission set and its programmatically-granted consent, the `Sites.Selected`
-> site boundary probed with the app's own token, the container hardening, and the
-> gitleaks history scan as a gating CI job.
+> **Every control below is now observed working against the live deployment.**
+> The two-app identity split, OIDC federation with no stored Azure credential,
+> the Key Vault reference and the managed identity's single scoped role
+> assignment, HTTPS-only ingress, the least-privilege Graph permission set, the
+> `Sites.Selected` site boundary, the container hardening, and the gitleaks
+> history scan as a gating CI job. The measurements are in
+> [`evidence/security/posture.md`](../evidence/security/posture.md).
 >
-> **Committed but not exercised:** everything that lives inside
-> `infra/main.bicep` — Key Vault, the Key Vault reference, the managed identity's
-> single role assignment, HTTPS-only ingress. None of those resources exist yet, so
-> every claim about them is a claim about a template that compiles, not about a
-> deployment. The OIDC federation is a special case: it has been exercised, and it
-> **failed** the first time for the reason documented in §1.
+> Two of them are worth reading for what they cost rather than what they claim:
+> the OIDC federation **failed twice before it worked** (§1), and the failure
+> alert built on top of all this **would not have fired** on the first real
+> failure it was tested against — see
+> [`evidence/monitoring/alerting.md`](../evidence/monitoring/alerting.md).
 >
 > Anything not implemented at all is listed under [Gaps](#gaps-what-is-not-done).
 
@@ -44,26 +45,43 @@ anywhere in the workflow. GitHub mints a short-lived OIDC token scoped to this
 repository — that is what `id-token: write` buys — `azure/login@v2` exchanges it
 for an access token, and the token dies with the job.
 
-The federated credential's `subject` pins trust to one repository and one
-execution context. `opsbridge-deploy` now holds **exactly one** federated
-credential, and its subject is
-`repo:Alhamwis/OpsBridge365:environment:production`. A mismatch fails as
-`AADSTS70021: No matching federated identity record found` — which is the failure
-mode you want, because it proves the trust really is that narrow.
+**This works: run `32115509179` deployed to Azure through it**, with no stored
+Azure credential of any kind in the pipeline.
 
-**This control has been exercised, and it refused a deploy.** The first pipeline
-run failed at the deploy job with exactly that error. The credential had been
-created for `repo:Alhamwis/OpsBridge365:ref:refs/heads/main`, but the deploy job
-is gated on the `production` GitHub environment, and **an environment-gated job
-gets a subject of `environment:<name>`, not `ref:<branch>`** — the branch does not
-appear in the subject at all. The credential was replaced with the
-environment-scoped one; the workflow has not been re-run since, so no successful
-deploy exists yet. `DEPLOYMENT.md` documents the subject rule in full, because it
-is the single most likely thing to bite someone reproducing this.
+The federated credential's `subject` pins trust to one repository and one
+execution context. `opsbridge-deploy` holds **exactly one** federated credential,
+and its subject is:
+
+```
+repo:Alhamwis@<ownerId>/OpsBridge365@<repoId>:environment:production
+```
+
+Two properties of that string are load-bearing, and each cost a failed deploy to
+discover:
+
+1. **`environment:production`, not `ref:refs/heads/main`.** An environment-gated
+   job presents a subject naming the environment; the branch does not appear at
+   all. Trust is pinned to a GitHub environment, so a workflow that drops the
+   environment gate stops authenticating rather than quietly continuing to work.
+2. **The `@<ownerId>` and `@<repoId>` qualifiers.** GitHub's default subject for
+   this account is **ID-qualified**, and `use_default: true` does not normalise
+   that away, so Entra must match the ID-qualified string. That form is
+   **rename-proof**: a subject built from names silently follows a repository or
+   account rename and can be inherited by whoever registers the freed name next;
+   one built from immutable ids cannot. It is a stronger binding, not a quirk to
+   work around.
+
+**This control has been exercised, and it refused a deploy — twice.** Both
+attempts failed with `AADSTS700213: No matching federated identity record found
+for presented assertion`, first on the ref-versus-environment mismatch, then on
+the ID qualification. [`DEPLOYMENT.md`](DEPLOYMENT.md#things-that-will-bite-you)
+documents both in full, because they are the single most likely thing to bite
+someone reproducing this.
 
 Worth naming plainly: this is what a narrow trust boundary looks like from the
 inside. A credential scoped `repo:*` or issued as a client secret would have
-deployed on the first attempt, and would have been the weaker configuration.
+deployed on the first attempt, and would have been the weaker configuration. Two
+failed runs is what the narrowness costs, and it is the right price.
 
 ### 2. Two app registrations, split by blast radius — **implemented**
 
@@ -137,7 +155,38 @@ exists once.** The provisioning script is idempotent (a re-run reports 13 EXISTS
 0 CREATED), so re-creating a bootstrap app for a future schema change is a
 deliberate, visible act rather than standing authority.
 
-### 3. The one secret lives in Key Vault
+### 3. The one secret lives in Key Vault — **verified against the deployment**
+
+Every bullet in this section used to describe a template. Each was then checked
+against the running resources; the checks are in
+[`evidence/security/posture.md`](../evidence/security/posture.md).
+
+| Check | Result |
+| --- | --- |
+| Container App secret `graph-client-secret` | **`keyVaultUrl` is set; there is no inline `value`** |
+| How the container receives it | `AZURE_CLIENT_SECRET` is a **`secretRef`**, resolved at replica start |
+| Deployment outputs | Exactly `apiFqdn`, `identityPrincipalId`, `jobName`, `keyVaultName`, `logAnalyticsWorkspaceId` — **no secret** |
+| Reading the secret **as the human operator** | **`ForbiddenByRbac`** |
+
+**Key Vault denies the human operator.** Only the user-assigned identity
+`opsbridge-id` holds Key Vault Secrets User on the vault. The operator who
+created the vault, and who holds Contributor plus Role Based Access Control
+Administrator on the resource group, **cannot read what is in it**.
+
+That denial is the strongest single line in this document, because least
+privilege is easy to assert and hard to demonstrate — and the demonstration is a
+refusal aimed at yourself. It works because the vault is **RBAC-authorized rather
+than access-policy based**: data-plane access is one explicit role assignment,
+and nothing inherits it from the management plane. Contributor on a resource
+group is broad, and it is tempting to assume it implies data access to
+everything inside; it does not.
+
+The operational corollary is worth stating rather than hiding: an operator who
+needs to rotate that secret must first grant themselves the role, visibly, as a
+role assignment somebody can see. Privileged access that leaves a trace beats
+standing authority that does not.
+
+The rest of the control, unchanged and now running:
 
 - `clientSecret` is a `@secure()` Bicep parameter — ARM does not log it, does not
   echo it into deployment history, and does not return it from
@@ -279,8 +328,9 @@ Verified by actually running the image — see
   `.dockerignore` keeps the build context under a kilobyte.
 - **`HEALTHCHECK` uses stdlib `urllib`** rather than adding `curl` — one less
   binary in the image and one less thing to abuse.
-- **HTTPS only.** Ingress sets `allowInsecure: false`; plain HTTP is redirected,
-  never served.
+- **HTTPS only, observed.** Ingress sets `allowInsecure: false`, and plain
+  `http://` against the live FQDN returns **301** to `https://`. That is measured
+  behaviour, not configured intent.
 
 ### 6. No secrets in Git — and the ordering that guarantees it
 
@@ -328,10 +378,11 @@ Both `ci.yml` and `deploy.yml` run a `secret-scan` job
   `infra/main.parameters.example.json` are **not** allowlisted — they scan clean
   on their own merits and must keep being scanned.
 
-**This job now runs on GitHub and passes.** In Actions run `32113268465` the
+**This job runs on GitHub and passes.** In Actions run `32115509179` the
 `secret scan (gitleaks)` job reported SUCCESS over the full history, alongside a
 SUCCESS on `test`; `build and push to ghcr.io` ran only because both gates
-cleared. It is no longer a locally-verified control.
+cleared, and `deploy to Azure` ran only because the build did. Every artifact
+that reached Azure passed a full-history secret scan first.
 
 A separate manual disclosure review ran before the repository was made public:
 zero real tenant, subscription, app, site or list identifiers in the working tree
@@ -389,13 +440,13 @@ against it — see [`COST.md`](COST.md).
 | --- | --- |
 | **Pull the published image and extract credentials** | There are none. Configuration arrives as environment variables at runtime; no `.env` or credential-bearing `ARG`/`ENV` is in the image (verified). The image is designed to be safe when public, which is what makes the pending visibility change a non-event |
 | **Steal the Graph client secret from the repo** | It was never committable — `.gitignore` was the first commit. It exists only in a GitHub Actions secret and in Key Vault |
-| **Steal it from the deployed app's configuration** | It is a Key Vault reference, not a stored value. Reading it needs the managed identity, which only Container Apps can assume |
+| **Steal it from the deployed app's configuration** | **Verified:** the app's secret carries a `keyVaultUrl` and no inline value, and the container gets a `secretRef`. Reading the value needs the managed identity, which only Container Apps can assume — the human operator gets `ForbiddenByRbac` |
 | **Steal it from deployment outputs or logs** | `@secure()` keeps it out of ARM history; no output emits a secret; no workflow step echoes one |
 | **Use the leaked Graph secret to attack Azure** | That app registration holds **no Azure RBAC at all**. It gets Graph read access plus write to one SharePoint site — nothing in ARM |
 | **Use the leaked Graph secret to attack the wider tenant** | Permissions are read-only on users and devices; SharePoint write is `Sites.Selected`, scoped to one site |
 | **Steal the Azure deploy credential** | There isn't one — verified, not assumed: `opsbridge-deploy` holds zero passwords and zero certificates. OIDC tokens are minted per run and expire with the job |
 | **Open a malicious PR to run code with secrets** | `ci.yml` has `contents: read` and no secrets, no registry login, no cloud login |
-| **Push to a side branch to deploy a backdoored image** | Deploy requires `refs/heads/main` **and** the `production` environment. The single federated credential's subject is `repo:Alhamwis/OpsBridge365:environment:production` — a token from any other context is refused by Entra, which is exactly how the first deploy attempt failed |
+| **Push to a side branch to deploy a backdoored image** | Deploy requires `refs/heads/main` **and** the `production` environment. The single federated credential's subject is `repo:Alhamwis@<ownerId>/OpsBridge365@<repoId>:environment:production` — a token from any other context is refused by Entra, which is exactly how the first two deploy attempts failed. The id qualifiers also mean a repository rename cannot carry the trust with it |
 | **Escalate inside the container** | Non-root uid 10001, no writable application filesystem, no shell tooling beyond the base image, no compiler |
 | **Hit `/metrics` to enumerate configuration** | Responses are generic; nothing echoes a variable name, tenant id or secret |
 | **Throttle or DoS the API to run up a bill** | `maxReplicas: 1`, plus the Container Apps free grant; job timeout capped at 30 minutes |
@@ -411,11 +462,6 @@ Stated plainly, because a security document that only lists wins is marketing.
   so this is available and is a two-click setting — it simply has not been turned
   on. The gitleaks job catches a committed secret; push protection blocks one
   before it is ever committed, which is strictly better.
-- **The GHCR package is private.** The image is published but anonymous
-  `docker pull` returns `unauthorized`. This is not a security control — it is an
-  unfinished step that will *block* the deploy, since a public package is what
-  lets Container Apps pull with no registry credential at all. GitHub exposes no
-  REST API for container package visibility; it is a UI-only setting.
 - **No dependency or container scanning.** No Dependabot, no CodeQL, no Trivy
   image scan. Dependencies are floor-pinned (`>=`) rather than lock-filed, so a
   build is not byte-reproducible.
@@ -427,13 +473,22 @@ Stated plainly, because a security document that only lists wins is marketing.
 - **Key Vault allows public network access** with `defaultAction: Allow`. Private
   endpoints and a firewall are the production answer; both cost money and neither
   is in the free tier.
-- **No control inside `infra/main.bicep` has been verified in Azure.** Key Vault,
-  the Key Vault reference, the managed identity's single scoped role assignment
-  and HTTPS-only ingress are claims about a template that compiles, not about a
-  deployment — none of those resources exist. What *has* been verified in Azure is
-  the surrounding identity layer: the resource group, the deploy app's zero
-  credentials, and its two role assignments at resource-group scope.
-- **The deploy pipeline has never completed successfully.** Three of four jobs
-  pass; the deploy job failed on the OIDC subject mismatch in §1 and has not been
-  re-run since the credential was corrected. Until it does, "OIDC deploys this"
-  remains a design claim with one recorded failure and no recorded success.
+- **A control was shipped broken, and testing is the only reason it is not still
+  broken.** The Log Analytics failure alert matched `config_error` only, while
+  the application's other failure status is `graph_error` — and the real failure
+  emitted the second one. Against a genuinely failed job the alert query returned
+  **0 hits**. It was syntactically valid, pointed at the right workspace, had a
+  sensible severity and window, and matched a status string the application
+  really does emit; reading it would never have caught it. The corrected query
+  returns 2 hits against that same failure. **An untested alert is an assumption,
+  not a control** — and the same doubt applies to every control in this document
+  that has not been deliberately triggered. See
+  [`evidence/monitoring/alerting.md`](../evidence/monitoring/alerting.md).
+- **The security controls are verified, not endurance-tested.** They were checked
+  against a deployment hours old, one user, one device and a handful of requests.
+  Nothing here has met a hostile request pattern, a credential rotation, a
+  privilege review, or a real incident.
+- **Teardown has never been exercised.** `destroy-cloud.ps1` is written and
+  preflight-checked but has not been run against the live resource group, so
+  "the blast radius is one resource group" is a design property that has not been
+  demonstrated by deleting it.
