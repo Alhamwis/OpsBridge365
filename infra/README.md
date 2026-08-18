@@ -64,12 +64,17 @@ There is exactly one secret in this system and it lives in exactly one place.
   **scoped to the vault** — not the resource group, not the subscription.
 - **No secret is emitted as an output.** The outputs are an FQDN, a vault
   *name*, a workspace id, a job name and a principal id — all safe to print.
-- The non-secret identifiers (tenant id, client id, site id, list ids) are plain
-  environment variables on purpose. They are public identifiers, not
+- The non-secret identifiers (Graph tenant id, client id, site id, list ids) are
+  plain environment variables on purpose. They are public identifiers, not
   credentials; putting them in Key Vault would add operations and indirection
   without adding protection.
 - No subscription id, tenant id, or secret value is hardcoded anywhere in
   `main.bicep`. Every environment-specific value is a parameter.
+- The vault's own `tenantId` is `subscription().tenantId` — the **Azure** tenant,
+  deliberately not `graphTenantId`. The container env var `AZURE_TENANT_ID`, by
+  contrast, is fed from `graphTenantId`: it is what MSAL turns into an authority,
+  so it has to be the Microsoft 365 tenant. Two tenants, two values, one
+  template.
 
 `main.parameters.json` (the filled-in copy) is gitignored. The recommended
 practice is to leave `clientSecret` out of the file entirely and pass it on the
@@ -104,7 +109,10 @@ identity, and scale-to-zero — is GA in `2024-03-01`.
 
 ### Prerequisites
 
-- Azure CLI logged in to the **trial tenant** (`az login --tenant <your-tenant>`)
+- Azure CLI logged in to the tenant that **owns the subscription** — the school
+  tenant (`az login --tenant <azure-tenant-id>`). The Graph app registration
+  lives in a different tenant and is referenced only by id, via `graphTenantId`;
+  no login to it is needed to deploy
 - The GHCR package marked **public** — a public image needs no registry
   credentials, which is why there is no `registries:` block in the template
 - Entra app registration with admin consent for exactly three Graph
@@ -127,7 +135,9 @@ az group create --name opsbridge-rg --location eastus
 
 ```powershell
 Copy-Item infra/main.parameters.example.json infra/main.parameters.json
-# edit main.parameters.json: containerImage, tenantId, clientId, site id, list ids
+# edit main.parameters.json: containerImage, graphTenantId, clientId, site id, list ids
+# graphTenantId is the Microsoft 365 tenant holding the Graph app registration -
+# NOT the Azure tenant that owns the subscription you are deploying into
 # leave clientSecret as "" - it is passed separately below
 ```
 

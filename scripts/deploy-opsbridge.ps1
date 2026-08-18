@@ -52,13 +52,26 @@
     powershell -NoProfile -File scripts/deploy-opsbridge.ps1
 
 .NOTES
-    Required environment variables (identifiers, except the last one):
-      AZURE_TENANT_ID       tenant the Entra app lives in
+    Required environment variables (identifiers, except the last one). All of
+    them describe the MICROSOFT 365 tenant - the one holding the Graph app
+    registration and the SharePoint site - not the Azure tenant that owns the
+    subscription. The Azure side comes from the ambient `az login` context and
+    is never read from the environment here.
+
+      GRAPH_TENANT_ID       tenant the Graph app registration lives in; becomes
+                            the Bicep graphTenantId parameter and, at runtime,
+                            the container's MSAL authority. NOT the Azure tenant
       GRAPH_CLIENT_ID       app id of the runtime Graph app registration
       SHAREPOINT_SITE_ID    Graph id of the SharePoint site
       ASSETS_LIST_ID        Graph id of the Assets list
       TICKETS_LIST_ID       Graph id of the Tickets list
       GRAPH_CLIENT_SECRET   the one real secret; never stored by this script
+
+    This script makes no role assignments. If you add one, use `az rest` against
+    .../providers/Microsoft.Authorization/roleAssignments/{guid}?api-version=2022-04-01
+    rather than `az role assignment`: that command group fails with
+    (MissingSubscription) on some machines even when --subscription is passed
+    explicitly, while the same operation over REST succeeds. See docs/DEPLOYMENT.md.
 #>
 
 [CmdletBinding()]
@@ -238,7 +251,8 @@ try {
     $account = Invoke-Native -FilePath $AzCli -CommandArgs @('account', 'show', '--only-show-errors', '-o', 'json')
     if ($account.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($account.Output)) {
         Stop-WithReason -Message 'the Azure CLI is not logged in.' -Remedy @(
-            'Run: az login --tenant <your-tenant-id>',
+            'Run: az login --tenant <azure-tenant-id>   # the tenant owning the subscription,',
+            '                                           # NOT $env:GRAPH_TENANT_ID',
             'Then: az account set --subscription <subscription-id>',
             'A deploy that starts without an authenticated session can only fail halfway.')
     }
@@ -310,8 +324,12 @@ try {
             'or set $env:OPSBRIDGE_IMAGE.')
     }
 
+    # GRAPH_TENANT_ID, not AZURE_TENANT_ID: this value ends up as the container's
+    # MSAL authority, so it must be the Microsoft 365 tenant where the Graph app
+    # is registered. The Azure tenant is whatever `az login` established above and
+    # is deliberately not read from the environment.
     $required = @(
-        @{ Name = 'AZURE_TENANT_ID'; Value = $env:AZURE_TENANT_ID; Secret = $false },
+        @{ Name = 'GRAPH_TENANT_ID'; Value = $env:GRAPH_TENANT_ID; Secret = $false },
         @{ Name = 'GRAPH_CLIENT_ID'; Value = $env:GRAPH_CLIENT_ID; Secret = $false },
         @{ Name = 'SHAREPOINT_SITE_ID'; Value = $env:SHAREPOINT_SITE_ID; Secret = $false },
         @{ Name = 'ASSETS_LIST_ID'; Value = $env:ASSETS_LIST_ID; Secret = $false },
@@ -327,7 +345,7 @@ try {
     if ($missing.Count -gt 0) {
         Stop-WithReason -Message ("missing environment variable(s): " + ($missing -join ', ')) -Remedy @(
             'Set them in this shell, for example:',
-            '  $env:AZURE_TENANT_ID = "<tenant-guid>"',
+            '  $env:GRAPH_TENANT_ID = "<microsoft-365-tenant-guid>"',
             '  $env:GRAPH_CLIENT_SECRET = "<secret>"',
             'Never commit these. The repo is public and .env is gitignored.',
             'The list ids come from: python scripts/provision_sharepoint.py')
@@ -390,7 +408,7 @@ try {
         '--parameters',
         "namePrefix=$NamePrefix",
         "containerImage=$ContainerImage",
-        "tenantId=$($env:AZURE_TENANT_ID)",
+        "graphTenantId=$($env:GRAPH_TENANT_ID)",
         "clientId=$($env:GRAPH_CLIENT_ID)",
         "clientSecret=$($env:GRAPH_CLIENT_SECRET)",
         "sharePointSiteId=$($env:SHAREPOINT_SITE_ID)",

@@ -6,7 +6,12 @@
     "infra/main.parameters.json (gitignored) and fill it in.",
     "Leave clientSecret empty here and pass it on the command line instead:",
     "  --parameters clientSecret=$env:GRAPH_CLIENT_SECRET",
-    "so the real secret never touches a file in the repo. This repo is public."
+    "so the real secret never touches a file in the repo. This repo is public.",
+    "",
+    "graphTenantId is the MICROSOFT 365 tenant that owns the Graph app",
+    "registration and the SharePoint site - NOT the Azure tenant that owns the",
+    "subscription these resources deploy into. They are different directories;",
+    "using the Azure one here deploys fine and then fails every Graph call."
   ],
   "parameters": {
     "location": {
@@ -18,7 +23,7 @@
     "containerImage": {
       "value": "ghcr.io/YOUR-GITHUB-USERNAME/opsbridge365:latest"
     },
-    "tenantId": {
+    "graphTenantId": {
       "value": "00000000-0000-0000-0000-000000000000"
     },
     "clientId": {
