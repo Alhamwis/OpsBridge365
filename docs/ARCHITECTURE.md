@@ -103,12 +103,15 @@ tickets. Naive timestamps are treated as UTC, which is what SharePoint stores.
 
 ## The two-tenant split
 
-The system spans two Microsoft 365 / Entra tenants, and this is deliberate.
+The system spans two Entra tenants, and this is deliberate. The division is not
+"dev and prod" — it is **who pays** versus **who can consent**.
 
-| | **TCC tenant** (institutional) | **Own tenant** (personally created) |
+| | **School tenant** (institutional) | **OpsBridge365 tenant** (personally owned) |
 | --- | --- | --- |
-| Holds | The Power Platform service desk: SharePoint lists, Power Apps, flows, Teams | The cloud layer: Entra app registrations, Graph-accessible users and devices, a SharePoint site with the Assets and Tickets lists |
-| Auth model | Standard connectors, signed-in user context | Application permissions, client credentials |
+| Owns | The Azure subscription (student credit), the resource group, and every Azure resource in it | The Microsoft 365 data plane: the SharePoint site with the Assets and Tickets lists, and the users and devices Graph reads |
+| Also holds | The Power Platform service desk: SharePoint lists, Power Apps, flows, Teams | — |
+| App registration | `opsbridge-deploy` — OIDC federated to this repo's `main`, no password, ARM rights on one resource group, **zero Graph permissions** | `opsbridge-graph` — client secret, Graph application permissions, **zero Azure RBAC** |
+| Auth model | Workload identity federation (deploy); standard connectors and signed-in user context (service desk) | Application permissions, client credentials |
 | Admin rights | None — a student account | Global admin — the tenant was created by, and belongs to, the author |
 | Lifetime | Permanent, no trial clock | Entra tenant permanent; the M365 E5 trial that adds SharePoint runs 30 days |
 
@@ -117,13 +120,17 @@ no-signed-in-user kind this service needs to run unattended on a cron — requir
 **tenant admin consent**. An institutional tenant will not grant a student's app
 registration `User.Read.All` and `Device.Read.All`, and asking is not a design.
 The only way to demonstrate app-only Graph access is to be the admin of the tenant
-you are consenting in, which means creating one.
+you are consenting in, which means creating one. Meanwhile the Azure credit lives
+with the school account, and student credit is not transferable. So the tenant
+that can consent and the tenant that can pay are necessarily different ones, and
+each half of the system is registered where it actually belongs.
 
 **Why not just run everything in the own tenant.** The service desk half was built
 first, in the institutional tenant, on standard connectors that cost nothing and
-never expire. Moving it would trade a permanent home for a 30-day trial clock.
+never expire. Moving it would trade a permanent home for a 30-day trial clock —
+and the Azure subscription could not follow anyway.
 
-**The consequence, stated plainly.** The sync writes to a SharePoint site in the
+**What this costs, stated plainly.** The sync writes to a SharePoint site in the
 *own* tenant, not the institutional one. Cross-tenant writes would need admin
 consent from the institutional side — the same door that is closed. So the Assets
 list is recreated in the own tenant with the same schema, which is what
@@ -131,6 +138,28 @@ list is recreated in the own tenant with the same schema, which is what
 service is tenant-specific: the site id and both list ids are configuration, so
 the same image deploys against any tenant that grants consent. That is how a
 vendor would ship it.
+
+### Two tenant ids, and why conflating them breaks the deploy
+
+Because the identities live in different directories, **there are two tenant ids
+in the pipeline and they are not interchangeable.**
+
+| | Deploy path | Graph runtime path |
+| --- | --- | --- |
+| Repo secret | `AZURE_TENANT_ID` | `GRAPH_TENANT_ID` |
+| Tenant | School (owns the subscription) | OpsBridge365 (owns the Graph app) |
+| Consumed by | `azure/login@v2` — and nothing else in the workflow | Bicep `graphTenantId` → container env `AZURE_TENANT_ID` → MSAL authority |
+
+The runtime path ends in `app/config.py`, which builds
+`https://login.microsoftonline.com/{azure_tenant_id}` and asks that authority for
+a token for `opsbridge-graph`. Feed it the school tenant and the request fails —
+that app registration does not exist in that directory — even though the ARM
+deployment itself succeeded. It is a silent-until-runtime failure, which is why
+the two ids are separate secrets with separate names rather than one value reused
+twice. The container's env var is still called `AZURE_TENANT_ID` (the
+conventional name for a client-credentials app), but its **value** is the
+Microsoft 365 tenant; Bicep's `graphTenantId` parameter is named to make that
+unambiguous at the point where the value is actually chosen.
 
 ---
 

@@ -19,32 +19,48 @@
 # this repository and exchanged for an access token by the federated app
 # registration. `id-token: write` is what allows that mint; nothing else does.
 #
-# TWO SEPARATE APP REGISTRATIONS. This is deliberate, and merging them back into
-# one to save a few clicks re-introduces the exact hole the split closes:
+# TWO SEPARATE APP REGISTRATIONS, IN TWO SEPARATE TENANTS. Both halves of that
+# sentence matter, and merging either one back together re-introduces a defect:
 #
 #   opsbridge-deploy  - deploys to Azure. OIDC federated credential, NO SECRET.
 #                       Has ARM rights on one resource group. No Graph perms.
+#                       Lives in the SCHOOL tenant, which owns the subscription.
 #   opsbridge-graph   - runtime Graph caller. HAS a client secret. Graph
 #                       application permissions only, NO Azure RBAC at all.
+#                       Lives in the MICROSOFT 365 tenant, which owns the
+#                       SharePoint data and can grant app-only Graph consent.
 #
-# If the two are one app, the long-lived Graph secret also carries ARM rights on
-# the resource group, so leaking it hands over the Azure scope as well as Graph -
-# and the stored credential defeats the point of using OIDC in the first place.
+# If the two apps are one app, the long-lived Graph secret also carries ARM
+# rights on the resource group, so leaking it hands over the Azure scope as well
+# as Graph - and the stored credential defeats the point of using OIDC at all.
 #
-# ---------------- identity A: opsbridge-deploy (OIDC, no secret) -------------
+# If the two TENANT IDS are one value, the deployed container builds its MSAL
+# authority from the wrong directory and every Graph token request fails with
+# "application not found in the directory". The two ids are therefore two
+# distinct repository secrets and are NEVER interchanged. AZURE_TENANT_ID
+# appears exactly once in this file, in the `azure/login` step.
+#
+# ------- identity A: opsbridge-deploy - SCHOOL tenant (OIDC, no secret) ------
 # | Secret                 | What it is                                       |
 # |------------------------|--------------------------------------------------|
 # | AZURE_CLIENT_ID        | App (client) id of the DEPLOY app registration.  |
 # |                        | Used by `azure/login` and NOWHERE ELSE in this   |
 # |                        | file. This app has no client secret.             |
-# | AZURE_TENANT_ID        | Directory (tenant) id. Shared by both identities |
-# |                        | (they live in the same tenant); a tenant id is a |
-# |                        | public identifier, not a credential.             |
+# | AZURE_TENANT_ID        | Directory (tenant) id of the tenant that owns    |
+# |                        | the Azure subscription. `azure/login` ONLY -     |
+# |                        | it is not the Graph tenant and must never be     |
+# |                        | passed to Bicep. A tenant id is a public         |
+# |                        | identifier, not a credential.                    |
 # | AZURE_SUBSCRIPTION_ID  | Subscription the resource group lives in.        |
 #
-# ---------------- identity B: opsbridge-graph (secret, no ARM) ---------------
+# ------- identity B: opsbridge-graph - M365 tenant (secret, no ARM) ----------
 # | Secret                 | What it is                                       |
 # |------------------------|--------------------------------------------------|
+# | GRAPH_TENANT_ID        | Directory (tenant) id of the Microsoft 365       |
+# |                        | tenant holding the Graph app and the SharePoint  |
+# |                        | site. Passed to Bicep as `graphTenantId`; the    |
+# |                        | container builds its MSAL authority from it.     |
+# |                        | A DIFFERENT tenant from AZURE_TENANT_ID.         |
 # | GRAPH_CLIENT_ID        | App (client) id of the GRAPH app registration.   |
 # |                        | Passed to Bicep as `clientId`. Never used to     |
 # |                        | authenticate this workflow to Azure.             |
@@ -227,9 +243,11 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Azure login (OIDC, passwordless)
-        # AZURE_CLIENT_ID is the *deploy* identity and is used here only. The
-        # Graph runtime identity is a different app registration entirely; see
-        # GRAPH_CLIENT_ID in the deploy step below.
+        # AZURE_CLIENT_ID and AZURE_TENANT_ID are the *deploy* identity and its
+        # home tenant - the one that owns the subscription - and this is the
+        # only step in the file that uses either. The Graph runtime identity is
+        # a different app registration in a different tenant; see
+        # GRAPH_TENANT_ID / GRAPH_CLIENT_ID in the deploy step below.
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
@@ -258,9 +276,15 @@ jobs:
           # into the command line, never echoed. No `set -x` in this step.
           #
           # These are the GRAPH runtime identity, not the deploy identity. The
-          # deploy identity (AZURE_CLIENT_ID) is deliberately absent from this
-          # step: it has no Graph permissions and must never end up in Key Vault.
-          TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          # deploy identity (AZURE_CLIENT_ID / AZURE_TENANT_ID) is deliberately
+          # absent from this step: it has no Graph permissions and must never
+          # end up in Key Vault or in a container's environment.
+          #
+          # GRAPH_TENANT_ID, not AZURE_TENANT_ID. The container turns this into
+          # its MSAL authority (https://login.microsoftonline.com/<id>), so it
+          # has to be the Microsoft 365 tenant where opsbridge-graph is
+          # registered - not the tenant that owns the Azure subscription.
+          GRAPH_TENANT_ID: ${{ secrets.GRAPH_TENANT_ID }}
           GRAPH_CLIENT_ID: ${{ secrets.GRAPH_CLIENT_ID }}
           GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
           SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
@@ -275,7 +299,7 @@ jobs:
             --parameters \
               namePrefix="$NAME_PREFIX" \
               containerImage="$CONTAINER_IMAGE" \
-              tenantId="$TENANT_ID" \
+              graphTenantId="$GRAPH_TENANT_ID" \
               clientId="$GRAPH_CLIENT_ID" \
               clientSecret="$GRAPH_CLIENT_SECRET" \
               sharePointSiteId="$SHAREPOINT_SITE_ID" \

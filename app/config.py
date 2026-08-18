@@ -4,6 +4,14 @@ Importing this module - or any module in :mod:`app` - must never raise, even
 with a completely empty environment. Validation happens the first time
 :func:`get_settings` is called, so tests and ``--help`` style imports work on a
 machine with no Azure credentials at all.
+
+A note on the ``AZURE_`` prefix, because it reads as the wrong thing: every
+``AZURE_*`` variable here describes the **Microsoft 365 tenant** the app calls
+Graph in, not the Azure tenant that owns the subscription the container runs
+on. Those are two different directories in this deployment. The names are kept
+because they are the conventional ones for a client-credentials app; the Bicep
+template feeds ``AZURE_TENANT_ID`` from its ``graphTenantId`` parameter for
+exactly this reason.
 """
 
 from __future__ import annotations
@@ -34,6 +42,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
+    # AZURE_TENANT_ID: the Microsoft 365 (Graph) tenant the app registration
+    # lives in - NOT the Azure tenant hosting the subscription. See the module
+    # docstring.
     azure_tenant_id: str
     azure_client_id: str
     azure_client_secret: str
@@ -46,7 +57,11 @@ class Settings(BaseSettings):
 
     @property
     def authority(self) -> str:
-        """MSAL authority URL for the client-credentials flow."""
+        """MSAL authority URL for the client-credentials flow.
+
+        Built from the Microsoft 365 tenant id; pointing it at the tenant that
+        owns the Azure subscription makes every token request fail.
+        """
         return f"https://login.microsoftonline.com/{self.azure_tenant_id}"
 
 

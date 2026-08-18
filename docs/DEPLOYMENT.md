@@ -25,24 +25,35 @@ allowlists exactly one value, the public Azure built-in role definition GUID in
 
 ---
 
-## Two app registrations, and why
+## Two app registrations, in two tenants, and why
 
-The system uses **two separate Entra app registrations**. They are not
-interchangeable, and the split is the security design — not bookkeeping.
+The system uses **two separate Entra app registrations, in two separate
+tenants**. They are not interchangeable, and the split is the security design —
+not bookkeeping.
 
 | | `opsbridge-deploy` | `opsbridge-graph` |
 |---|---|---|
+| Lives in | The **school tenant** — the one that owns the Azure subscription | The **Microsoft 365 tenant** — the one that owns the SharePoint data |
 | Job | Deploy infrastructure to Azure | Call Microsoft Graph at runtime |
 | Auth | OIDC federated credential | Client secret |
 | Client secret? | **No. Never. Not one.** | Yes — the only stored password in the system |
 | Azure RBAC | Contributor + RBAC-admin, **resource group scope only** | **None at all.** It never touches ARM |
 | Graph app permissions | **None** | `User.Read.All`, `Device.Read.All`, `Sites.Selected` |
 | Used by | `azure/login@v2` | The containers, via Key Vault |
-| Repo secrets | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` |
+| Repo secrets | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET` |
 
-Both live in the same tenant, so `AZURE_TENANT_ID` is reused for the Bicep
-`tenantId` parameter. That is fine: a tenant id is a public identifier, not a
-credential.
+**The two tenant ids are different values and must never be swapped.**
+`AZURE_TENANT_ID` is the directory `azure/login@v2` authenticates the deploy
+identity against; it appears in exactly one step of `deploy.yml` and is never
+passed to Bicep. `GRAPH_TENANT_ID` is the directory `opsbridge-graph` is
+registered in; it becomes the Bicep `graphTenantId` parameter, then the
+container's `AZURE_TENANT_ID` env var, then the MSAL authority the runtime asks
+for a Graph token. Reuse one for the other and the ARM deployment still succeeds
+— the failure surfaces later, as every Graph call rejecting a token from a
+directory the app does not exist in. Neither value is a credential; a tenant id
+is a public identifier. See
+[`ARCHITECTURE.md` § The two-tenant split](ARCHITECTURE.md#the-two-tenant-split)
+for why the tenants are split in the first place.
 
 > **Do not merge these into one app registration "for convenience."** One app
 > would mean a long-lived Graph client secret attached to a principal that also
@@ -67,11 +78,15 @@ Bicep parameter, lands in Key Vault, and is read at container start by the
 user-assigned managed identity. The workflow never sees a password that grants
 it access to the subscription.
 
-### One-time setup — A. `opsbridge-deploy` (no secret, ever)
+### One-time setup — A. `opsbridge-deploy` (school tenant, no secret ever)
+
+Sign in to the tenant that owns the **Azure subscription** before running this
+block: `az login --tenant <AZURE_TENANT_ID>`.
 
 ```bash
-# 1. App registration (in YOUR tenant). Note: NO `az ad app credential reset`
-#    anywhere below - this app must never have a client secret.
+# 1. App registration (in the SCHOOL tenant, alongside the subscription).
+#    Note: NO `az ad app credential reset` anywhere below - this app must never
+#    have a client secret.
 az ad app create --display-name opsbridge-deploy
 DEPLOY_APP_ID=$(az ad app list --display-name opsbridge-deploy --query '[0].appId' -o tsv)
 az ad sp create --id "$DEPLOY_APP_ID"
@@ -96,22 +111,70 @@ az ad app federated-credential create --id "$DEPLOY_APP_ID" --parameters federat
 #    only because main.bicep creates a Key Vault "Secrets User" role assignment
 #    for the container identity. (Role Based Access Control Administrator is a
 #    tighter substitute if your tenant offers it.)
+#
+#    These use `az rest`, not `az role assignment create`, on purpose - see
+#    "Workaround: az role assignment fails with MissingSubscription" below.
 az group create -n opsbridge365-rg -l eastus
 RG=$(az group show -n opsbridge365-rg --query id -o tsv)
-az role assignment create --assignee "$DEPLOY_APP_ID" --role Contributor --scope "$RG"
-az role assignment create --assignee "$DEPLOY_APP_ID" --role "User Access Administrator" --scope "$RG"
+SUB=$(az account show --query id -o tsv)
+
+# principalId is the service principal's OBJECT id, not the app id.
+DEPLOY_SP_ID=$(az ad sp show --id "$DEPLOY_APP_ID" --query id -o tsv)
+
+# Built-in role definition ids (public, identical in every tenant):
+CONTRIBUTOR=b24988ac-6180-42a0-ab88-20f7382dd24c
+USER_ACCESS_ADMIN=18d7d88d-d35e-4fb5-a5c3-7773c20a72d9
+
+for ROLE in "$CONTRIBUTOR" "$USER_ACCESS_ADMIN"; do
+  az rest --method put \
+    --url "https://management.azure.com${RG}/providers/Microsoft.Authorization/roleAssignments/$(uuidgen)?api-version=2022-04-01" \
+    --body "{\"properties\":{\"roleDefinitionId\":\"/subscriptions/${SUB}/providers/Microsoft.Authorization/roleDefinitions/${ROLE}\",\"principalId\":\"${DEPLOY_SP_ID}\",\"principalType\":\"ServicePrincipal\"}}"
+done
+
+# Read them back (also via REST, for the same reason):
+az rest --method get \
+  --url "https://management.azure.com${RG}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=assignedTo('${DEPLOY_SP_ID}')" \
+  --query "value[].properties.roleDefinitionId" -o tsv
 
 # 5. Grant this app NO Microsoft Graph application permissions. It never calls
 #    Graph. Verify the list is empty:
 az ad app show --id "$DEPLOY_APP_ID" --query requiredResourceAccess
 ```
 
+#### Workaround: `az role assignment` fails with `MissingSubscription`
+
+On some machines every `az role assignment` subcommand fails before it reaches
+the network:
+
+```
+(MissingSubscription) The request did not have a subscription or a valid
+tenant level resource provider.
+```
+
+It fails even with `--subscription` passed explicitly, so it is not a
+missing-context problem — the command group resolves its ARM scope through a
+path that the two-tenant login here does not satisfy. The underlying REST API is
+unaffected, which is why the block above calls
+`https://management.azure.com{scope}/providers/Microsoft.Authorization/roleAssignments/{guid}?api-version=2022-04-01`
+directly. `PUT` with a fresh GUID creates an assignment and is idempotent for a
+given (scope, role, principal) triple; a repeat with a *different* GUID returns
+`RoleAssignmentExists`, which is safe to ignore.
+
+No script in `scripts/` uses `az role assignment` — role assignments are made by
+`infra/main.bicep` (the Key Vault one) or by hand here, so this workaround is
+documentation only.
+
 Replace `OWNER/OpsBridge365` with the real `owner/repo`. The subject string must
 match exactly — a mismatch fails as `AADSTS70021: No matching federated identity
 record found`, which is the failure mode you want (it means the trust really is
 scoped to one repo and one ref).
 
-### One-time setup — B. `opsbridge-graph` (secret, no ARM)
+### One-time setup — B. `opsbridge-graph` (Microsoft 365 tenant, secret, no ARM)
+
+**Different tenant.** Sign out of the school tenant and in to the Microsoft 365
+one first: `az login --allow-no-subscriptions --tenant <GRAPH_TENANT_ID>`. That
+tenant has no Azure subscription, hence the flag. Running this block against the
+school tenant creates an app that can never be consented.
 
 ```bash
 # 1. Separate app registration for the runtime Graph caller
@@ -146,9 +209,15 @@ az ad app permission admin-consent --id "$GRAPH_APP_ID"
 #        "grantedToIdentities": [ { "application":
 #          { "id": "<GRAPH_APP_ID>", "displayName": "opsbridge-graph" } } ] }
 
-# 5. NO role assignment. Do not run `az role assignment create` for this app.
-#    It has no business touching ARM. Verify it holds nothing:
-az role assignment list --assignee "$GRAPH_APP_ID" --all -o table   # expect empty
+# 5. NO role assignment. Do not create one for this app - it has no business
+#    touching ARM, and it lives in a tenant with no subscription to touch.
+#    Verify it holds nothing (from a shell logged in to the AZURE tenant;
+#    `az rest`, not `az role assignment list`, for the MissingSubscription
+#    reason documented above):
+GRAPH_SP_ID=$(az ad sp show --id "$GRAPH_APP_ID" --query id -o tsv)
+az rest --method get \
+  --url "https://management.azure.com/subscriptions/${SUB}/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01&\$filter=assignedTo('${GRAPH_SP_ID}')" \
+  --query "value" -o json    # expect []
 ```
 
 ---
@@ -157,30 +226,35 @@ az role assignment list --assignee "$GRAPH_APP_ID" --all -o table   # expect emp
 
 `Settings → Secrets and variables → Actions → Secrets`.
 
-### Deploy identity — `opsbridge-deploy` (no secret exists for this app)
+Nine secrets in total: three describe the deploy identity, three describe the
+Graph identity, three locate the data. Each of the first two groups is scoped to
+**one tenant, and not the other**.
 
-| Secret | What it is | Where it is used |
-|---|---|---|
-| `AZURE_CLIENT_ID` | App (client) id of the **deploy** app registration — the one holding the federated credential. An identifier, not a password. | `azure/login@v2` **only** |
-| `AZURE_TENANT_ID` | Directory (tenant) id. Shared by both apps; a public identifier. | `azure/login@v2`; Bicep `tenantId` |
-| `AZURE_SUBSCRIPTION_ID` | Subscription containing the resource group. | `azure/login@v2` |
+### Deploy identity — `opsbridge-deploy`, **school tenant** (no secret exists for this app)
+
+| Secret | Tenant | What it is | Where it is used |
+|---|---|---|---|
+| `AZURE_CLIENT_ID` | School | App (client) id of the **deploy** app registration — the one holding the federated credential. An identifier, not a password. | `azure/login@v2` **only** |
+| `AZURE_TENANT_ID` | School | Directory (tenant) id of the tenant that owns the Azure subscription. Not the Graph tenant. A public identifier. | `azure/login@v2` **only** — never passed to Bicep |
+| `AZURE_SUBSCRIPTION_ID` | School | Subscription containing the resource group. | `azure/login@v2` |
 
 There is no `AZURE_CLIENT_SECRET`, and there must never be one.
 
-### Graph runtime identity — `opsbridge-graph` (holds the only password)
+### Graph runtime identity — `opsbridge-graph`, **Microsoft 365 tenant** (holds the only password)
 
-| Secret | What it is | Where it is used |
-|---|---|---|
-| `GRAPH_CLIENT_ID` | App (client) id of the **Graph** app registration. Never used to authenticate to Azure. | Bicep `clientId` → container env |
-| `GRAPH_CLIENT_SECRET` | Client secret of the Graph app. Used by the **containers** to call Microsoft Graph. This app holds no Azure RBAC, so the secret grants Graph access and nothing else. | Bicep `clientSecret` → Key Vault |
+| Secret | Tenant | What it is | Where it is used |
+|---|---|---|---|
+| `GRAPH_TENANT_ID` | Microsoft 365 | Directory (tenant) id of the tenant the Graph app is registered in and the SharePoint site lives in. A **different value** from `AZURE_TENANT_ID`. | Bicep `graphTenantId` → container env `AZURE_TENANT_ID` → MSAL authority |
+| `GRAPH_CLIENT_ID` | Microsoft 365 | App (client) id of the **Graph** app registration. Never used to authenticate to Azure. | Bicep `clientId` → container env |
+| `GRAPH_CLIENT_SECRET` | Microsoft 365 | Client secret of the Graph app. Used by the **containers** to call Microsoft Graph. This app holds no Azure RBAC, so the secret grants Graph access and nothing else. | Bicep `clientSecret` → Key Vault |
 
-### Data locations (identifiers, not credentials)
+### Data locations (identifiers, not credentials — all in the Microsoft 365 tenant)
 
-| Secret | What it is | Where it is used |
-|---|---|---|
-| `SHAREPOINT_SITE_ID` | Graph id of the SharePoint site holding both lists. | Bicep `sharePointSiteId` |
-| `ASSETS_LIST_ID` | Graph id of the Assets list (written by the sync job). | Bicep `assetsListId` |
-| `TICKETS_LIST_ID` | Graph id of the Tickets list (read by `/metrics`). | Bicep `ticketsListId` |
+| Secret | Tenant | What it is | Where it is used |
+|---|---|---|---|
+| `SHAREPOINT_SITE_ID` | Microsoft 365 | Graph id of the SharePoint site holding both lists. | Bicep `sharePointSiteId` |
+| `ASSETS_LIST_ID` | Microsoft 365 | Graph id of the Assets list (written by the sync job). | Bicep `assetsListId` |
+| `TICKETS_LIST_ID` | Microsoft 365 | Graph id of the Tickets list (read by `/metrics`). | Bicep `ticketsListId` |
 
 `GITHUB_TOKEN` is **not** in these tables — it is injected by Actions and is the
 only credential used to push to ghcr.io. No PAT to create, rotate, or leak.
@@ -232,9 +306,10 @@ Both write their result to the run's job summary.
 
 ## Secret hygiene in the pipeline
 
-- The deploy identity and the Graph identity are separate app registrations, so
-  `AZURE_CLIENT_ID` appears in exactly one place — the `azure/login@v2` step —
-  and `GRAPH_CLIENT_ID`/`GRAPH_CLIENT_SECRET` appear only in the Bicep step. The
+- The deploy identity and the Graph identity are separate app registrations in
+  separate tenants, so `AZURE_CLIENT_ID` and `AZURE_TENANT_ID` appear in exactly
+  one place — the `azure/login@v2` step — and `GRAPH_TENANT_ID`,
+  `GRAPH_CLIENT_ID` and `GRAPH_CLIENT_SECRET` appear only in the Bicep step. The
   principal with ARM rights has no secret; the secret has no ARM rights.
 - Secrets are referenced only as `${{ secrets.NAME }}` and reach the Azure CLI
   through the step `env:` block — never interpolated into a command line.

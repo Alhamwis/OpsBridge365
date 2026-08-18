@@ -16,6 +16,15 @@
 //
 // Nothing here contains a subscription id, a tenant id, or a secret value -
 // every environment-specific value arrives as a parameter.
+//
+// TWO TENANTS ARE IN PLAY and they are not the same directory:
+//   * the Azure tenant owning this subscription - implicit, reached through
+//     subscription().tenantId, and what the Key Vault control plane uses;
+//   * the Microsoft 365 tenant owning the Graph app and the SharePoint site -
+//     supplied explicitly as the `graphTenantId` parameter and handed to the
+//     containers as AZURE_TENANT_ID, the value MSAL builds its authority from.
+// Passing the Azure tenant id as `graphTenantId` compiles and deploys happily,
+// then fails every Graph token request at runtime. Keep them distinct.
 // =============================================================================
 
 targetScope = 'resourceGroup'
@@ -33,10 +42,10 @@ param namePrefix string = 'opsbridge'
 @description('Full container image reference, e.g. ghcr.io/OWNER/opsbridge365:latest. The GHCR package must be public - a public image needs no registry credentials.')
 param containerImage string
 
-@description('Entra tenant id the sync authenticates against (the trial tenant, not TCC). Not a secret.')
-param tenantId string
+@description('Tenant id of the Microsoft 365 tenant where the Graph app registration lives - the directory the containers build their MSAL authority from. This is NOT the Azure tenant that owns this subscription. Not a secret.')
+param graphTenantId string
 
-@description('Application (client) id of the Entra app registration. Not a secret.')
+@description('Application (client) id of the Graph app registration in the Microsoft 365 tenant above. Not a secret.')
 param clientId string
 
 @description('Client secret for the Entra app registration. Stored in Key Vault and read at runtime through the managed identity - it is never inlined into a container definition and never returned as an output.')
@@ -86,8 +95,10 @@ var commonTags = {
 // and noise without adding protection. Only the client secret is a secret.
 var configEnv = [
   {
+    // Named AZURE_TENANT_ID because that is what app/config.py reads, but the
+    // value is the Microsoft 365 (Graph) tenant, not the Azure one.
     name: 'AZURE_TENANT_ID'
-    value: tenantId
+    value: graphTenantId
   }
   {
     name: 'AZURE_CLIENT_ID'
@@ -152,6 +163,10 @@ resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   location: location
   tags: commonTags
   properties: {
+    // The vault's own control-plane tenant - the AZURE tenant that owns this
+    // subscription, deliberately NOT graphTenantId. A vault can only trust
+    // principals from its own directory, and the managed identity below is
+    // created here.
     tenantId: subscription().tenantId
     sku: {
       family: 'A'
