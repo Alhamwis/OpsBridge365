@@ -2,10 +2,17 @@
 
 What this architecture is expected to cost, why, and what would break that.
 
-> **No bill has ever been observed.** Nothing is deployed — there is no Azure
-> subscription yet. Everything below is derived from the resource configuration in
+> **Observed spend so far: $0.00 — and that number means less than it looks.**
+> The subscription is real, the resource group `rg-opsbridge365` exists, and a
+> budget guards it. But **no billable resource is deployed**: nothing from
+> `infra/main.bicep` has ever been submitted to ARM, so there is no Container Apps
+> environment, no Key Vault and no Log Analytics workspace to bill for. $0.00 is
+> what an empty resource group costs. It is not yet evidence that the *running*
+> architecture costs nothing.
+>
+> Everything below is therefore still derived from the resource configuration in
 > `infra/main.bicep` and published Azure pricing, not from a Cost Management
-> export. `evidence/cost/` is empty and will stay empty until something runs.
+> export of a running system. `evidence/cost/` stays empty until something runs.
 > Prices are list rates at time of writing, quoted for the *shape* of the bill;
 > they change, and they vary by region.
 
@@ -77,9 +84,12 @@ State them, because "free" without assumptions is a sales claim.
    `DEBUG` log level in production, or a much larger device fleet all move real
    volume. The application logs at `INFO` and truncates Graph error bodies to 500
    characters, which is a deliberate part of this.
-5. **The GHCR package stays public.** A private package would need pull
-   credentials, which means a registry secret in Key Vault — or ACR, which has no
-   free tier.
+5. **The GHCR package is public.** Stated as an assumption because it is
+   **currently false**: the package is published but private, so anonymous
+   `docker pull` returns `unauthorized`. Until it is made public, Container Apps
+   cannot pull it without registry credentials — which would mean a registry
+   secret in Key Vault, or ACR, which has no free tier. This is a pending step,
+   not a design change; see [`DEPLOYMENT.md`](DEPLOYMENT.md).
 6. **The device and ticket lists stay small.** The sync pages through *all* users
    and *all* devices on every run. At tens of devices that is seconds; at tens of
    thousands it is minutes of replica time per run, plus Graph throttling and the
@@ -113,22 +123,29 @@ State them, because "free" without assumptions is a sales claim.
 
 ## Guardrails
 
-Three exist in the code, and one is a manual step:
+Four exist. Three are in the template and unexercised; the fourth is **live in
+Azure right now**, and it is the only one of the four that does not depend on a
+deployment.
 
-1. **`replicaTimeout: 1800`** on the sync job — a hung Graph call is killed at 30
-   minutes and cannot bill indefinitely.
-2. **`replicaRetryLimit: 1`** — a failing sync retries once and then waits for the
-   next cron tick, instead of looping on a Graph outage and burning free-grant
-   seconds.
-3. **`maxReplicas: 1`** on the API — caps what traffic can spend.
-4. **A budget alert**, which has to be set by hand once a subscription exists:
+| # | Guardrail | State |
+| --- | --- | --- |
+| 1 | **`replicaTimeout: 1800`** on the sync job — a hung Graph call is killed at 30 minutes and cannot bill indefinitely | In `main.bicep`; not deployed |
+| 2 | **`replicaRetryLimit: 1`** — a failing sync retries once and then waits for the next cron tick, instead of looping on a Graph outage and burning free-grant seconds | In `main.bicep`; not deployed |
+| 3 | **`maxReplicas: 1`** on the API — caps what traffic can spend | In `main.bicep`; not deployed |
+| 4 | **Budget `opsbridge-monthly-20`** — $20/month, scoped to the resource group, alerting at **50% and 90% of actual** and **100% forecasted** | ✅ **Live.** Current spend $0.00 |
 
-```powershell
-az consumption budget create --budget-name opsbridge-guard --amount 20 `
-  --time-grain Monthly --category Cost
-```
+The budget deliberately came *first*, before any resource that could spend money.
+A cost guardrail created after the workload it guards has already had a window in
+which it was not guarded — and the forecast alert in particular only helps if it
+predates the spending it is meant to predict.
 
-Expected spend is $0. The point of a $20 alert is not that it will fire — it is
+Note what each alert threshold buys, because three of them is not redundancy:
+50% actual is "something is running that you did not expect," 90% actual is "act
+now," and 100% *forecasted* fires on a trajectory rather than a total — it can
+warn on day 4 of a month that the run rate ends above $20, which the actual-spend
+alerts cannot do until it is nearly too late.
+
+The point of a $20 alert is not that it will fire. Expected spend is $0. It is
 knowing where the guardrail is, and finding out from an email rather than from a
 statement.
 
@@ -149,5 +166,8 @@ retention set inside the free window. Every one of those was a decision with a
 stated trade-off — cold starts, no in-process state, a public image.
 
 What it does *not* mean: it is not free at production scale, it is not free with a
-polled dashboard, and it has not been measured. The first real bill is the only
-thing that would turn these numbers from arithmetic into evidence.
+polled dashboard, and **it has not been measured.** The $0.00 currently showing in
+Cost Management is the cost of an empty resource group, not of a running system.
+The first bill from an actually-deployed Container Apps environment is the only
+thing that would turn these numbers from arithmetic into evidence — and the $20
+budget is already in place to catch it if the arithmetic is wrong.

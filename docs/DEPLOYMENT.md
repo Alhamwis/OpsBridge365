@@ -91,20 +91,25 @@ az ad app create --display-name opsbridge-deploy
 DEPLOY_APP_ID=$(az ad app list --display-name opsbridge-deploy --query '[0].appId' -o tsv)
 az ad sp create --id "$DEPLOY_APP_ID"
 
-# 2. Federated credential: trust *this repo's main branch*, nothing else
+# 2. Federated credential. READ THE SUBJECT RULE BELOW BEFORE RUNNING THIS.
+#    The deploy job is gated on the `production` GitHub environment, so the
+#    subject GitHub presents is `environment:production` - NOT `ref:...`.
+#    A `ref:refs/heads/main` credential does NOT work for that job.
 cat > federated.json <<'JSON'
 {
-  "name": "github-main",
+  "name": "github-production",
   "issuer": "https://token.actions.githubusercontent.com",
-  "subject": "repo:OWNER/OpsBridge365:ref:refs/heads/main",
+  "subject": "repo:OWNER/OpsBridge365:environment:production",
   "audiences": ["api://AzureADTokenExchange"]
 }
 JSON
 az ad app federated-credential create --id "$DEPLOY_APP_ID" --parameters federated.json
 
-# 3. The deploy job uses a GitHub environment (`production`), so add a second
-#    credential for that subject too:
-#    "repo:OWNER/OpsBridge365:environment:production"
+# 3. Confirm this is the ONLY credential on the app - both the only federated
+#    one and the only credential of any kind. Expect one subject, and two
+#    empty lists.
+az ad app federated-credential list --id "$DEPLOY_APP_ID" --query "[].subject" -o tsv
+az ad app show --id "$DEPLOY_APP_ID" --query "{passwords:passwordCredentials, certs:keyCredentials}"
 
 # 4. Role assignments - RESOURCE GROUP SCOPE, never the subscription.
 #    Contributor deploys the template; User Access Administrator is required
@@ -141,6 +146,68 @@ az rest --method get \
 az ad app show --id "$DEPLOY_APP_ID" --query requiredResourceAccess
 ```
 
+#### The OIDC subject gotcha — this cost a failed deploy
+
+**If you reproduce one thing from this document, reproduce this.** It is the most
+likely thing to bite you, it produces an error message that points at the wrong
+problem, and it is invisible until the pipeline is otherwise entirely green.
+
+The rule:
+
+> **An environment-gated job presents `environment:<name>`. It does not present
+> `ref:<branch>` — the branch does not appear in the subject at all.**
+
+`deploy.yml`'s deploy job declares `environment: production`. That single line
+changes the `sub` claim in the OIDC token GitHub mints:
+
+| Job declares | Subject GitHub presents |
+| --- | --- |
+| no `environment:`, push to `main` | `repo:OWNER/REPO:ref:refs/heads/main` |
+| `environment: production` | `repo:OWNER/REPO:environment:production` |
+| pull request | `repo:OWNER/REPO:pull_request` |
+| tag push | `repo:OWNER/REPO:ref:refs/tags/v1.0.0` |
+
+**What actually happened here.** `opsbridge-deploy` was created with a
+`repo:Alhamwis/OpsBridge365:ref:refs/heads/main` credential — which reads
+correctly, matches the workflow's trigger, and is wrong. Actions run
+`32113268465` passed `test`, passed the gitleaks scan, built and pushed the image
+to ghcr.io, and then **failed at the deploy job**:
+
+```
+AADSTS70021: No matching federated identity record found for presented
+assertion.
+```
+
+Nothing about that message says "your job is environment-gated." It reads like a
+tenant, app-id or audience problem, and it is easy to spend an hour there.
+
+**The fix.** One federated credential, subject
+`repo:Alhamwis/OpsBridge365:environment:production`. The app now holds exactly
+that one and nothing else.
+
+**Why not just add both credentials.** Because the `ref:refs/heads/main` one would
+never be used — no job in this pipeline presents that subject — and an unused
+federated credential is a second trust path nobody is checking. If a future job
+drops the environment gate, the deploy would silently start working through a
+credential that was never meant to authorise it. One credential, one execution
+context, and a job that changes its gating fails loudly instead of quietly
+succeeding.
+
+**How to diagnose it in thirty seconds.** Compare two strings. What the credential
+accepts:
+
+```bash
+az ad app federated-credential list --id "$DEPLOY_APP_ID" --query "[].subject" -o tsv
+```
+
+What the job presents: read it off the table above from the job's own `on:` and
+`environment:` keys — no token inspection needed. If the job has an `environment:`
+key, the subject ends in `environment:<that value>`, full stop.
+
+They must match **character for character**. The repository path is
+case-sensitive, and the environment name is the string in the workflow file, not a
+display name in the UI.
+
 #### Workaround: `az role assignment` fails with `MissingSubscription`
 
 On some machines every `az role assignment` subcommand fails before it reaches
@@ -166,8 +233,8 @@ documentation only.
 
 Replace `OWNER/OpsBridge365` with the real `owner/repo`. The subject string must
 match exactly — a mismatch fails as `AADSTS70021: No matching federated identity
-record found`, which is the failure mode you want (it means the trust really is
-scoped to one repo and one ref).
+record found`, which is the failure mode you want, and which is exactly what
+happened here. See [the subject gotcha above](#the-oidc-subject-gotcha--this-cost-a-failed-deploy).
 
 ### One-time setup — B. `opsbridge-graph` (Microsoft 365 tenant, secret, no ARM)
 
@@ -286,6 +353,12 @@ The build uses `docker/build-push-action@v6` with GitHub Actions layer caching
 image is what lets Container Apps pull with no registry credentials at all —
 that is the whole reason for ghcr.io over ACR.
 
+> **Currently private.** `ghcr.io/alhamwis/opsbridge365` is published at `:latest`
+> and `:8954c91018c24774705672d146554f7c788aad32`, but the package visibility is
+> still private and anonymous `docker pull` returns `unauthorized`. This must be
+> changed before a deploy can succeed. It cannot be scripted — GitHub exposes no
+> REST API for container package visibility, so it is a UI-only setting.
+
 ---
 
 ## Post-deploy verification
@@ -349,19 +422,45 @@ belongs on the command line or in Key Vault, never in a committed file.
 
 ## Current state — read this first
 
-**Nothing is deployed.** As of the last commit:
+**The accounts, the identities and the data all exist. No Azure resource from
+`infra/main.bicep` is deployed.**
 
-- This repository has **no git remote**, so neither workflow has ever executed.
-  There is no GitHub repository, no Actions run, and no GHCR package.
-- There is **no Azure subscription**, no Entra tenant, no app registration, and no
-  resource group.
-- `infra/main.bicep` **compiles clean** (`bicep build infra/main.bicep`, Bicep CLI
-  0.46.1, zero diagnostics) but has never been submitted to ARM — not even with
-  `--what-if`, which requires an authenticated subscription.
-- The container image builds and runs locally; the test suite passes (58 offline tests; 10 live tests are opt-in via `pytest -m integration`).
+Done, and verified:
 
-Every step in Phase 1 below is blocked on a human creating an account. None of it
-can be automated, which is why it is listed separately and first.
+- The repository is **public** on GitHub, default branch `main`, with a pipeline
+  that runs. Actions run `32113268465`: `test` SUCCESS, `secret scan (gitleaks)`
+  SUCCESS, `build and push to ghcr.io` SUCCESS.
+- The image is published as `ghcr.io/alhamwis/opsbridge365:latest` and
+  `:8954c91018c24774705672d146554f7c788aad32`.
+- Resource group `rg-opsbridge365` exists in `eastus`, and a `$20`/month budget
+  (`opsbridge-monthly-20`) guards it. Observed spend **$0.00**.
+- `opsbridge-deploy` exists with zero passwords, zero certificates and zero Graph
+  permissions — one federated credential, and RBAC (Contributor + Role Based
+  Access Control Administrator) scoped to that resource group only.
+- `opsbridge-graph` exists in the Microsoft 365 tenant with three admin-consented
+  application permissions and zero delegated grants. The SharePoint site exists,
+  `Sites.Selected` is granted `write` on that one site, and the `Assets` and
+  `Tickets` lists are provisioned and seeded.
+- **12 live integration tests pass** against that tenant; **58 offline tests**
+  pass with no credentials.
+
+Not done:
+
+- **The `deploy to Azure` job FAILED**, on the OIDC subject mismatch documented
+  above. The federated credential has been corrected; the workflow has **not been
+  re-run since**, so there is no successful deploy.
+- **No resource from `infra/main.bicep` exists.** No Log Analytics workspace, no
+  Container Apps environment, no Key Vault, no managed identity, no
+  `opsbridge-sync` job, no `opsbridge-api`. The template compiles clean
+  (`bicep build`, Bicep CLI 0.46.1, zero diagnostics) and has never been submitted
+  to ARM — not even with `--what-if`.
+- **The GHCR package is private.** Anonymous `docker pull` returns `unauthorized`.
+  This blocks the deploy: a public package is what lets Container Apps pull with
+  no registry credential. It is a UI-only setting — GitHub exposes no REST API for
+  container package visibility.
+
+So the remaining path is short and specific: make the package public, re-run the
+workflow. Everything Phase 1 used to gate on is already done.
 
 ## Graph permissions — the authoritative list
 
@@ -394,23 +493,33 @@ show --id 00000003-0000-0000-c000-000000000000 --query
 
 ---
 
-## Phase 1 — the human steps (cannot be automated)
+## Phase 1 — the human steps: **all done**
 
-Each requires an interactive, signed-in person. Roughly 60–90 minutes total, most
-of it waiting for tenant provisioning.
+These were the six steps that could not be automated. Every one is complete. The
+table is kept because it is the reproduction path for anyone building this from
+the repository, and because two of them turned out differently from the plan.
 
-| # | Step | Why a human is required | Unblocks |
+| # | Step | Status | What actually happened |
 | --- | --- | --- | --- |
-| H1 | **Azure for Students** signup at `azure.microsoft.com/free/students` with an academic address | Student identity verification. No card, but the check is interactive | The subscription, `az login` |
-| H2 | **Create your own Entra tenant** — Azure portal → Microsoft Entra ID → Manage tenants → Create | Portal tenant creation requires a signed-in human. Free, permanent, and you become global admin — which is the whole point | App registrations, admin consent |
-| H3 | **Start a Microsoft 365 E5 trial** on that tenant | Adds SharePoint to the tenant. Requires a payment method on file (not charged if cancelled). Start the 30-day clock only when you are ready to use it | SharePoint site, both lists |
-| H4 | **`gh auth login`** (device code) and create the GitHub repository | Interactive device-code flow | Push, Actions, GHCR |
-| H5 | **`az login`** against the new tenant | Interactive MFA | Everything in Azure |
-| H6 | **Grant admin consent** to the Graph app permissions | One global-admin click in the portal, or `az ad app permission admin-consent` as an admin | Any Graph call the service makes |
+| H1 | **Azure subscription** | ✅ Done | "Azure for Students" on the Tarrant County College tenant. Resource group `rg-opsbridge365` created in `eastus` |
+| H2 | **A tenant that can grant app-level consent** | ✅ Done | A separate OpsBridge365 tenant, where the author is global admin. See [`ARCHITECTURE.md` § The two-tenant split](ARCHITECTURE.md#the-two-tenant-split) |
+| H3 | **Microsoft 365 with SharePoint** | ✅ Done | **M365 Business Standard, not the E5 trial.** A paid Business Standard subscription has no 30-day clock, which removes the "capture the evidence before the trial expires" pressure the earlier revision of this runbook warned about |
+| H4 | **GitHub repository** | ✅ Done | Public: `github.com/Alhamwis/OpsBridge365`. A disclosure review ran first — zero real identifiers in the working tree or anywhere in the history |
+| H5 | **`az login`** | ✅ Done | Both tenants. Note the Graph tenant needs `--allow-no-subscriptions` |
+| H6 | **Graph admin consent** | ✅ Done — **and not by clicking** | Granted **programmatically** by creating `appRoleAssignments` on the service principal, then verified by reading the consent state back. Three application permissions, zero delegated grants |
 
-Order matters: H2 before H3 (the trial attaches to a tenant), H2 before the app
-registrations, and H6 last — you cannot consent to permissions on an app that does
-not exist.
+**H6 is worth dwelling on.** Every version of this runbook before now described
+admin consent as "one global-admin click." It does not have to be. Creating the
+`appRoleAssignment` objects directly makes the grant reproducible, reviewable and
+diffable — and reading the consent state back afterwards is what turns "consent
+was requested" into "consent exists," which a portal click does not give you.
+
+### What remains, and it is not a human-blocked step
+
+| Step | Blocked on |
+| --- | --- |
+| Make the GHCR package public | A UI-only visibility setting; GitHub exposes no REST API for it. Container Apps needs it to pull without a registry credential |
+| Re-run `deploy.yml` | Nothing — the OIDC credential is fixed. It has simply not been triggered again |
 
 ### Prerequisites on the workstation
 
@@ -425,13 +534,16 @@ rather than reporting a false "not installed".
 
 ---
 
-## Phase 2 — one-time setup, once the accounts exist
+## Phase 2 — one-time setup: **done, except step 6**
 
-1. **Create both app registrations** — the `opsbridge-deploy` and `opsbridge-graph`
-   scripts earlier in this document. Do not merge them; the reasoning is above and
-   in [`SECURITY.md`](SECURITY.md).
-2. **Create the SharePoint site** in the trial tenant.
-3. **Provision the lists** — idempotent, and safe to run repeatedly:
+1. ✅ **Both app registrations created** — `opsbridge-deploy` and
+   `opsbridge-graph`, in two different tenants. Do not merge them; the reasoning
+   is above and in [`SECURITY.md`](SECURITY.md).
+2. ✅ **SharePoint site created** —
+   `https://opsbridge365.sharepoint.com/sites/opsbridge365ops`.
+3. ✅ **Lists provisioned** — `Assets` and `Tickets`, each seeded with 4 synthetic
+   rows, by `scripts/provision_sharepoint.py`. A second run reported **13 EXISTS /
+   0 CREATED**, which is the idempotency claim demonstrated rather than asserted.
 
    ```bash
    python scripts/provision_sharepoint.py --dry-run   # plan only, sends nothing
@@ -442,24 +554,40 @@ rather than reporting a false "not installed".
    values the repository secrets want. It creates only what is missing and never
    modifies or deletes anything that already exists; it seeds only a list that is
    completely empty.
-4. **Authorize the app on that one site** — `Sites.Selected` grants nothing until
-   you do (`POST /sites/{site-id}/permissions`, `"roles": ["write"]`).
-5. **Add the repository secrets and variables** from the tables above.
-6. **Push, then mark the GHCR package public** (`Packages → opsbridge365 → Package
-   settings → Change visibility`). A public image is what lets Container Apps pull
-   with no registry credentials at all.
+
+   > **`Sites.Selected` with `write` cannot create lists.** This was an open
+   > question in earlier revisions; it is now settled. Creating the schema needed
+   > a site-administrative permission, so a **throwaway `opsbridge-bootstrap` app
+   > held `Sites.FullControl.All` for exactly that step and was then deleted.** The
+   > runtime identity never held FullControl and its permissions were not widened.
+   > If you reproduce this, do the same — and delete the app, not just the grant.
+   > See [`SECURITY.md` §2a](SECURITY.md#2a-the-bootstrap-app--a-privilege-escalation-documented-and-reversed).
+
+4. ✅ **App authorised on that one site** — `Sites.Selected` grants nothing until
+   you do this (`POST /sites/{site-id}/permissions`, `"roles": ["write"]`). Role
+   `write`, one site.
+5. ✅ **Repository secrets and variables added** from the tables above.
+6. 🟡 **Mark the GHCR package public** (`Packages → opsbridge365 → Package
+   settings → Change visibility`) — **not yet done.** The package is currently
+   private and anonymous `docker pull` returns `unauthorized`. A public image is
+   what lets Container Apps pull with no registry credentials at all, so this
+   gates the deploy. There is no REST API for it; it is a UI-only setting.
 
 ## Phase 3 — the automated path
 
-After Phase 2, deployment is a `git push`:
+After Phase 2, deployment is a `git push`. Here is the pipeline with the status
+each stage has actually reached, from Actions run `32113268465`:
 
 ```
 push to main
-  -> test            ruff (advisory) + pytest (hard gate)
-  -> build-and-push  docker build -> ghcr.io, tagged :latest and :<sha>
-  -> deploy          az deployment group create against infra/main.bicep, via OIDC
+  -> secret-scan     gitleaks over the full history          SUCCESS
+  -> test            ruff (advisory) + pytest (hard gate)    SUCCESS
+  -> build-and-push  docker build -> ghcr.io, :latest+:<sha> SUCCESS
+  -> deploy          az deployment group create via OIDC     FAILED  (AADSTS70021,
+                     the subject mismatch documented above; credential fixed,
+                     not yet re-run)
   -> verify          GET /healthz must return 200; the sync job must report
-                     triggerType == Schedule
+                     triggerType == Schedule                 NOT REACHED
 ```
 
 Either verification failing fails the deploy — a deploy that cannot be verified is
@@ -488,9 +616,10 @@ powershell -NoProfile -File scripts/verify-opsbridge.ps1
 ```
 
 Read-only, and it never conflates "checked and passed" with "could not check". A
-check that could not run is **SKIP**, never PASS. Run it today, with nothing
-deployed, and it reports the local toolchain, the test suite and the container as
-PASS and every cloud check as SKIP with the reason — which is the honest picture.
+check that could not run is **SKIP**, never PASS. Run it today and it reports the
+local toolchain, the test suite and the container as PASS, and every check that
+depends on a deployed resource as SKIP with the reason — which is the honest
+picture, because no resource from `main.bicep` exists.
 
 Manual equivalents:
 
@@ -506,12 +635,19 @@ curl https://<apiFqdn>/metrics
 
 ```bash
 bicep build infra/main.bicep --stdout > /dev/null   # compiles clean, 0 diagnostics
-python -m pytest -q                                 # 58 passed, 10 deselected
+python -m pytest -q                                 # 58 passed, 12 deselected
 docker build -t opsbridge365:local .
 ```
 
+With tenant credentials in the environment, the live suite too:
+
+```bash
+python -m pytest -m integration -q                  # 12 passed, 58 deselected
+```
+
 `az deployment group validate` and `--what-if` both need an authenticated
-subscription, so neither has been run.
+subscription against a resource group, and neither has been run — the template
+has never been submitted to ARM in any form.
 
 ---
 
@@ -552,7 +688,7 @@ reports.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `AADSTS70021: No matching federated identity record found` | The federated credential's `subject` does not match the workflow's context | Match it exactly: `repo:OWNER/REPO:ref:refs/heads/main`, plus one for `environment:production` |
+| `AADSTS70021: No matching federated identity record found` | The federated credential's `subject` does not match the workflow's context. **Overwhelmingly the most likely cause: the job is environment-gated, so it presents `environment:<name>`, not `ref:refs/heads/main`.** This is the failure that happened here | Set the subject to `repo:OWNER/REPO:environment:production`. Full explanation: [the OIDC subject gotcha](#the-oidc-subject-gotcha--this-cost-a-failed-deploy) |
 | First deployment fails resolving the Key Vault reference | Azure RBAC propagation lag — the role assignment exists but has not taken effect | Re-run the identical command. It is idempotent and the second run succeeds |
 | `/healthz` never returns 200 in the verify step | Cold start exceeded the ~3-minute retry window, or the container is crashing | Check the Log Analytics stream; the app logs the reason on startup |
 | `/metrics` returns 503 | Configuration is incomplete — the response deliberately does not say which variable | Read the container log; it names every missing variable |

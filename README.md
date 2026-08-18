@@ -6,12 +6,18 @@ pulls users and devices from Microsoft Graph and writes them into a SharePoint
 SLA numbers. It is packaged as one container image with two entrypoints, deployed
 by one Bicep template, and designed to cost nothing while idle.
 
-> **Deployment status, stated up front:** nothing in this repository is running in
-> Azure. The Azure subscription, the Entra tenant, and the Microsoft 365 tenant it
-> targets do not exist yet — they need a human to create accounts. The code, the
-> container, the infrastructure template and the pipelines are written and, where
-> they can be, verified locally. The [status table](#status) says exactly which is
-> which, per component.
+> **Deployment status, stated up front.** The accounts are real and the data plane
+> is live; the Azure compute is not deployed. Concretely: the repository is public,
+> its pipeline runs, and it publishes a container image to ghcr.io. The Microsoft
+> 365 tenant, the `opsbridge-graph` app registration with three admin-consented
+> application permissions, the SharePoint site and both lists all exist — twelve
+> integration tests pass against them. What does **not** exist is anything
+> `infra/main.bicep` declares: no Log Analytics workspace, no Container Apps
+> environment, no Key Vault, no sync Job, no API. The deploy job has run once and
+> failed on an OIDC subject mismatch; the federated credential has been corrected
+> and the job has not been re-run since. The [status table](#status) puts every
+> component in one of three buckets — live and verified, built but not deployed,
+> not started — and nothing is promoted a bucket for looking good.
 
 ---
 
@@ -49,7 +55,7 @@ nothing was resolved in the window, rather than a misleading 0% or 100%.
 ```mermaid
 flowchart LR
     dev["git push to main"] --> gha["GitHub Actions"]
-    gha -->|"build and push"| ghcr["GHCR - public image"]
+    gha -->|"build and push"| ghcr["GHCR - published image"]
     gha -->|"OIDC federated login"| arm["az deployment group create"]
     arm --> bicep["infra/main.bicep"]
 
@@ -94,7 +100,9 @@ machine. No credentials needed.
 
 #### Live integration tests (opt-in)
 
-`tests/integration/` holds ten tests that hit the real Microsoft 365 tenant.
+`tests/integration/` holds twelve tests that hit the real Microsoft 365 tenant.
+**All twelve pass** against it — `12 passed, 58 deselected in 10.06s`, captured in
+[`evidence/graph/live-integration-run.md`](evidence/graph/live-integration-run.md).
 They are **deselected by default** — `addopts = "-ra -m 'not integration'"` in
 `pyproject.toml` — so a bare `python -m pytest` never reaches for a credential.
 Opt in explicitly:
@@ -120,10 +128,14 @@ the suite stays green on a machine with no credentials.
 
 They are safe to re-run. Exactly one test writes — a PATCH round-trip on a single
 Assets row — and it restores the original value in a `finally` block, so the
-lists are left exactly as found. Two are negative tests: a wrong client secret
-must raise `GraphAuthError`, and a request for a site the app was *not* granted
-must return **403**. That 403 is the evidence that `Sites.Selected` is genuinely
-scoped to one site rather than acting as tenant-wide SharePoint access.
+lists are left exactly as found. Several are negative tests: a wrong client secret
+must raise `GraphAuthError`, and *data* on a site the app was never granted
+(`/drive`, `/drive/root/children`) plus both tenant-wide enumeration paths
+(`/sites?search=*`, `/sites/getAllSites`) must all return **403**. Those 403s are
+the evidence that `Sites.Selected` is genuinely scoped to one site. Note what they
+deliberately do *not* assert: an ungranted site's **metadata** is readable and
+returns 200, which is expected Microsoft behaviour — see
+[`docs/SECURITY.md`](docs/SECURITY.md#what-sitesselected-does-and-does-not-hide).
 
 ### Run locally
 
@@ -164,50 +176,66 @@ never PASS — an unauthenticated run tells you exactly what it did *not* verify
 
 ## Status
 
-Honest, per component. Three categories, and nothing is promoted a category for
-looking good.
+Three categories. **Live and verified** means it exists and was observed working.
+**Built, not deployed** means the code is written and passes what can be checked
+without the cloud, and nothing of it is running. **Not started** means exactly
+that. Nothing is promoted a category for looking good — in particular, every Azure
+resource `infra/main.bicep` declares is in the middle category, not the first.
 
-| Component | Status | How that is known |
-| --- | --- | --- |
-| Graph client — auth, paging, 429/503 retry with `Retry-After` | ✅ **Implemented + tested locally** | 58 tests pass offline; `tests/test_graph.py` covers paging, throttling, timeout, malformed JSON |
-| SharePoint client — list reads, asset PATCH | ✅ **Implemented + tested locally** | `tests/test_sharepoint.py` asserts the PATCH payload shape |
-| Sync job (`python -m app.sync`) | ✅ **Implemented + tested locally** | `tests/test_sync.py`: ambiguous keys match nothing, unresolved values become `"Unknown"` |
-| SLA metrics computation | ✅ **Implemented + tested locally** | `tests/test_metrics.py`: zero denominator returns `null`, not a fake percentage |
-| FastAPI `/healthz` + `/metrics` | ✅ **Implemented + tested locally** | `tests/test_api.py`; also exercised in a real container |
-| Container image (multi-stage, non-root uid 10001) | ✅ **Implemented + tested locally** | Built and run on this machine — [`evidence/docker/build-and-run.md`](evidence/docker/build-and-run.md) |
-| Bicep template (`infra/main.bicep`) | 🟡 **Implemented, awaiting cloud credentials** | Compiles clean with Bicep CLI 0.46.1, zero diagnostics. **Never deployed** — no Azure subscription exists |
-| SharePoint provisioning script | 🟡 **Implemented, awaiting cloud credentials** | `--dry-run` plan runs offline and is the automatic fallback with no credentials. Never run against a real site |
-| Operator scripts (deploy / verify / destroy) | 🟡 **Implemented, awaiting cloud credentials** | `verify-opsbridge.ps1` runs end to end today and reports the cloud checks as SKIP. Deploy and destroy have never touched Azure |
-| CI workflow (`ci.yml`) | 🟡 **Implemented, awaiting cloud credentials** | Written and reviewed. **Never executed** — this repository has no git remote, so no run exists on GitHub |
-| Secret scanning (gitleaks, full history) | 🟡 **Implemented, verified locally** | `secret-scan` job in both workflows, hard gate on `build-and-push`. The scan itself was run locally over the full history (gitleaks v8.30.1, 6 commits) and is clean; the *job* has never run on GitHub |
-| Deploy workflow (`deploy.yml`) | 🟡 **Implemented, awaiting cloud credentials** | Same — written, never run. OIDC federation cannot be configured without both accounts |
-| Integration tests against a real tenant | 🟡 **Written, not yet executed here** | `tests/integration/test_live_graph.py` — 10 tests, opt-in via `pytest -m integration`. The machine these docs were written on has no credentials in its environment, so they have only been seen to collect and skip, never to pass. Nobody should read this row as "the live tenant is verified" |
-| Azure subscription (Azure for Students) | ⛔ **Blocked on human account creation** | Student identity verification |
-| Own Entra tenant + app registrations | ⛔ **Blocked on human account creation** | Portal tenant creation requires a signed-in human |
-| Microsoft 365 E5 trial (adds SharePoint) | ⛔ **Blocked on human account creation** | Requires a payment method on file |
-| GitHub account / repo / GHCR package | ⛔ **Blocked on human account creation** | `gh auth login` device code |
-| Graph admin consent | ⛔ **Blocked on human account creation** | One global-admin click, after the tenant exists |
-| Every Azure resource — Container Apps, Key Vault, Log Analytics | ⛔ **Blocked on human account creation** | Requires `az login` against a real subscription |
-| Log Analytics failure alert, budget guardrail, cost verification | ⛔ **Blocked on human account creation** | Requires deployed resources to attach to |
+### ✅ Live and verified
 
-**Test suite, re-run independently while writing these docs:**
+| Component | Evidence |
+| --- | --- |
+| Public GitHub repository, default branch `main` | [`github.com/Alhamwis/OpsBridge365`](https://github.com/Alhamwis/OpsBridge365). A disclosure review ran before it went public: zero real tenant, subscription or app identifiers in the working tree or anywhere in the commit history |
+| Offline test suite | **58 passed**, integration deselected, no credentials and no network needed |
+| Live integration suite against the real tenant | **12 passed** — [`evidence/graph/live-integration-run.md`](evidence/graph/live-integration-run.md). These exercise Graph auth, paging, the Assets read/PATCH round trip and the `Sites.Selected` boundary against real Microsoft Graph |
+| CI `test` job on GitHub Actions | Run `32113268465` — **SUCCESS** |
+| Secret scanning (gitleaks, full history) job | Run `32113268465` — **SUCCESS**. Hard gate on `build-and-push`, no `continue-on-error` |
+| Container image build and push to ghcr.io | Run `32113268465` — **SUCCESS**. Published as `ghcr.io/alhamwis/opsbridge365:latest` and `:8954c91018c24774705672d146554f7c788aad32` |
+| Container image, locally | Multi-stage, non-root uid 10001, `/healthz` 200 with an empty environment — [`evidence/docker/build-and-run.md`](evidence/docker/build-and-run.md) |
+| Azure resource group `rg-opsbridge365` (`eastus`) | Created. **Empty** — it holds no resources from `main.bicep` |
+| Deploy identity `opsbridge-deploy` | Created. Zero passwords, zero certificates, zero Graph permissions — federated OIDC only. RBAC is Contributor + Role Based Access Control Administrator, **both scoped to the resource group only**. RBAC Administrator is needed because Contributor cannot create the Key Vault Secrets User assignment in `main.bicep` |
+| Budget guardrail `opsbridge-monthly-20` | $20/month on the resource group, alerts at 50% and 90% actual and 100% forecasted. Observed spend **$0.00** |
+| Microsoft 365 tenant with SharePoint | M365 Business Standard, SharePoint provisioned |
+| Graph identity `opsbridge-graph` | Created, holding exactly three admin-consented **application** permissions — `User.Read.All`, `Device.Read.All`, `Sites.Selected` — and zero delegated grants. Consent was granted programmatically via `appRoleAssignments`, then verified by reading the consent state back |
+| `Sites.Selected` site-scoped grant | Role `write` on **one** site, `https://opsbridge365.sharepoint.com/sites/opsbridge365ops`. The boundary was then probed with the app's own token; results in [`docs/SECURITY.md`](docs/SECURITY.md#what-sitesselected-does-and-does-not-hide) |
+| SharePoint `Assets` and `Tickets` lists | Provisioned by `scripts/provision_sharepoint.py`, each seeded with 4 synthetic rows. A second run reported **13 EXISTS / 0 CREATED**, which is the idempotency claim actually tested rather than asserted |
+| Bootstrap privilege, granted and reversed | A throwaway `opsbridge-bootstrap` app held `Sites.FullControl.All` only long enough to create the list schema — `Sites.Selected` `write` cannot create lists — and was then **deleted**. The runtime identity never held FullControl |
+
+### 🟡 Built, not deployed
+
+| Component | State, and what it waits on |
+| --- | --- |
+| Every Azure resource in `infra/main.bicep` — Log Analytics, Container Apps environment, Key Vault, managed identity, the `opsbridge-sync` Job, the `opsbridge-api` App | **None of these exist.** The template compiles clean (Bicep CLI 0.46.1, zero diagnostics) but has never been submitted to ARM — not even `--what-if`. Waiting on a successful `deploy` job |
+| `deploy.yml` deploy job | **Has run once and failed.** The cause was an OIDC subject mismatch: the job is environment-gated, so GitHub presents `repo:Alhamwis/OpsBridge365:environment:production`, while the federated credential matched `...:ref:refs/heads/main`. The app now carries exactly one federated credential, the environment-scoped one. Waiting on a re-run |
+| GHCR package visibility | The image is published but the package is **private** — anonymous `docker pull` returns `unauthorized`. Container Apps pulls with no registry credentials only from a public package. Waiting on a UI-only visibility change; GitHub exposes no REST API for it |
+| Operator scripts `deploy-opsbridge.ps1`, `destroy-cloud.ps1` | Written, preflight-checked, never run against Azure. `verify-opsbridge.ps1` does run end to end today and reports the cloud checks as SKIP |
+| API and sync job as *running workloads* | Both are tested offline, both run in a local container, neither has ever run in Azure. Waiting on the deploy |
+
+### ⛔ Not started
+
+| Component | Why |
+| --- | --- |
+| Log Analytics failure alert | Needs a deployed workspace to attach to |
+| Evidence for `evidence/azure/`, `evidence/monitoring/`, `evidence/sharepoint/`, `evidence/cost/` | Nothing has been deployed to capture. `evidence/docker/` and `evidence/graph/` are populated; the rest are empty on purpose |
+| Dependency and container image scanning | No Dependabot, no CodeQL, no Trivy — see [`docs/SECURITY.md`](docs/SECURITY.md) Gaps |
+| Authentication in front of `/metrics` | Public and unauthenticated by design for a demo; not acceptable for a real deployment |
+
+**Test suite, re-run independently:**
 
 ```
 $ python -m pytest -q
-..........................................................               [100%]
-58 passed, 10 deselected in 1.82s
+58 passed, 12 deselected
+
+$ python -m pytest -m integration -q      # credentials in the environment
+12 passed, 58 deselected in 10.06s
 ```
 
-The 10 deselected are the live integration tests (see Quickstart). The 58 that
-ran needed no network and no credentials.
-
-Two things this table deliberately does *not* claim: there is no measured cold
-start time, no uptime figure, and no throughput number anywhere in this
-repository, because nothing has run in Azure to measure. And `opsbridge-state.json`
-is a build-tracking artifact that has drifted — it still marks Docker, Bicep and
-the workflows `NOT_STARTED`, the test count as 56, and the integration tests
-as blocked on a tenant that now exists. This table and the repo are
-authoritative over it.
+What this table still does **not** claim: there is no measured cold start, uptime
+or throughput figure anywhere in this repository, because nothing has run in Azure
+to measure. The cost figures in [`docs/COST.md`](docs/COST.md) are arithmetic over
+published pricing; the only observed number is $0.00, which is what an empty
+resource group costs.
 
 ---
 
@@ -219,7 +247,7 @@ authoritative over it.
 | API | FastAPI + uvicorn |
 | HTTP / auth | httpx (async), MSAL client-credentials flow |
 | Validation | Pydantic v2, pydantic-settings |
-| Tests | pytest, pytest-asyncio, respx — 58 offline tests, plus 10 opt-in live tests |
+| Tests | pytest, pytest-asyncio, respx — 58 offline tests, plus 12 opt-in live tenant tests |
 | Lint | ruff (`E`, `F`, `I`, `UP`, `B`, line length 100) |
 | Container | Multi-stage Dockerfile on `python:3.12-slim`, non-root uid 10001 |
 | Infrastructure | Bicep, one file, resource-group scope |
@@ -241,7 +269,7 @@ app/                    the service
   models.py             Pydantic models for Graph, lists, responses
   main.py               FastAPI app - /healthz, /metrics
 tests/                  58 offline tests
-  integration/          10 live tenant tests, deselected by default
+  integration/          12 live tenant tests, deselected by default
 infra/                  main.bicep + parameter example + infra/README.md
 .github/workflows/      ci.yml (PR) and deploy.yml (main)
 scripts/                deploy / verify / destroy + SharePoint provisioning
