@@ -22,12 +22,32 @@ their own. They are not secrets, but they look like high-entropy strings to the
 generic-api-key rule. Only the specific GUIDs actually used by this template are
 allowlisted, by exact value, so any other high-entropy string still fails.
 
+Azure RBAC role definition IDs:
   4633458b-17de-408a-b874-0445c86b69e6  Key Vault Secrets User
                                         (infra/main.bicep: keyVaultSecretsUserRoleId)
+  b24988ac-6180-42a0-ab88-20f7382dd24c  Contributor
+  f58310d9-a9f6-439a-9e8d-f62e7b41a168  Role Based Access Control Administrator
+  18d7d88d-d35e-4fb5-a5c3-7773c20a72d9  User Access Administrator
+
+Microsoft Graph application permission (app role) IDs - these identify WHICH
+permission is being requested. Knowing one grants nothing; consent does.
+  df021288-bdef-4463-88db-98f22de89214  User.Read.All
+  7438b122-aefc-4978-80ed-43db9fcc7715  Device.Read.All
+  883ea226-0bf2-4a8f-9f9d-92c9162a727d  Sites.Selected
+
+Every value above is documented by Microsoft and identical in every tenant.
+They are listed by exact value, never by pattern, so a real 36-char credential
+that merely looks like a GUID is still caught.
 """
 regexTarget = "match"
 regexes = [
   '''4633458b-17de-408a-b874-0445c86b69e6''',
+  '''b24988ac-6180-42a0-ab88-20f7382dd24c''',
+  '''f58310d9-a9f6-439a-9e8d-f62e7b41a168''',
+  '''18d7d88d-d35e-4fb5-a5c3-7773c20a72d9''',
+  '''df021288-bdef-4463-88db-98f22de89214''',
+  '''7438b122-aefc-4978-80ed-43db9fcc7715''',
+  '''883ea226-0bf2-4a8f-9f9d-92c9162a727d''',
 ]
 
 # Deliberately NOT allowlisted, because they do not need to be - both were

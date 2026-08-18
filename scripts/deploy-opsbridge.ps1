@@ -22,7 +22,7 @@
 
 .PARAMETER ResourceGroup
     Target resource group. Defaults to $env:AZURE_RESOURCE_GROUP, then
-    'opsbridge365-rg' (the same default as .github/workflows/deploy.yml).
+    'rg-opsbridge365' (the same default as .github/workflows/deploy.yml).
 
 .PARAMETER Location
     Region used only if the resource group has to be created. Defaults to
@@ -107,7 +107,7 @@ if ([string]::IsNullOrWhiteSpace($ResourceGroup)) {
         $ResourceGroup = $env:AZURE_RESOURCE_GROUP
     }
     else {
-        $ResourceGroup = 'opsbridge365-rg'
+        $ResourceGroup = 'rg-opsbridge365'
     }
 }
 

@@ -37,7 +37,14 @@ packages = ["app"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-addopts = "-ra"
+# Integration tests hit the real Microsoft 365 tenant, so they are deselected by
+# default: a bare `python -m pytest` runs only the offline suite and needs no
+# credentials. Opt in explicitly with `pytest -m integration`; the command-line
+# -m overrides the one below.
+addopts = "-ra -m 'not integration'"
+markers = [
+    "integration: hits the live Microsoft 365 tenant (needs credentials); run with `pytest -m integration`",
+]
 
 [tool.ruff]
 line-length = 100

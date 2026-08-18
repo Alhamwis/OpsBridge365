@@ -203,7 +203,7 @@ then:
    a few seconds. Narrate it: *"that pause is the container starting — there was no
    replica running a second ago, which is why an idle month costs nothing."* Then
    curl again to show it is instant while warm.
-3. **Run the sync on demand.** `az containerapp job start -g opsbridge365-rg -n
+3. **Run the sync on demand.** `az containerapp job start -g rg-opsbridge365 -n
    opsbridge-sync`, then `az containerapp job execution list -o table`.
 4. **Show the SharePoint Assets list updating** — side by side with the job's JSON
    summary, pointing at the rows that stayed `Unknown` and explaining why that is

@@ -120,6 +120,29 @@ def test_resolved_ticket_without_a_due_date_is_excluded_not_assumed_met() -> Non
     assert metrics.sla_compliance_7d_pct == 100.0
 
 
+def test_resolved_ticket_without_a_resolved_date_cannot_count_as_compliant() -> None:
+    """A row marked Resolved but carrying no ResolvedDate is unmeasurable.
+
+    The seeded/live Tickets rows are synthetic and SharePoint columns are all
+    optional, so this combination is reachable in production. Without a
+    resolution timestamp there is nothing to compare against the due date, so
+    the ticket must fall out of both the numerator and the denominator - never
+    be waved through as met. T1 is the ambiguous row; T2 is the only measurable
+    one, and it breached, so an honest result here is 0%, not 50% or 100%.
+    """
+    tickets = [
+        _ticket("T1", "Resolved", due_offset=-timedelta(days=1)),
+        _ticket("T2", "Resolved", -timedelta(days=2, hours=1), -timedelta(days=2)),
+    ]
+
+    metrics = compute_metrics(tickets, now=NOW)
+
+    assert metrics.open_tickets == 0  # it is resolved, so it is not open either
+    assert metrics.resolved_last_7d == 1
+    assert metrics.sla_measured_last_7d == 1
+    assert metrics.sla_compliance_7d_pct == 0.0
+
+
 def test_zero_denominator_returns_none_rather_than_a_made_up_percentage() -> None:
     """Nothing resolved in 7 days: report "no data", never 0% or 100%."""
     tickets = [

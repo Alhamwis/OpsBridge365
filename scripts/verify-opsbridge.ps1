@@ -22,7 +22,7 @@
 
 .PARAMETER ResourceGroup
     Azure resource group to inspect. Defaults to $env:AZURE_RESOURCE_GROUP, then
-    'opsbridge365-rg' (the default used by .github/workflows/deploy.yml).
+    'rg-opsbridge365' (the default used by .github/workflows/deploy.yml).
 
 .PARAMETER NamePrefix
     Bicep namePrefix, used to derive the app and job names. Default 'opsbridge'.
@@ -80,7 +80,7 @@ if ([string]::IsNullOrWhiteSpace($ResourceGroup)) {
         $ResourceGroup = $env:AZURE_RESOURCE_GROUP
     }
     else {
-        $ResourceGroup = 'opsbridge365-rg'
+        $ResourceGroup = 'rg-opsbridge365'
     }
 }
 

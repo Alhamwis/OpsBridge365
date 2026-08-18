@@ -80,7 +80,7 @@
 # -------------------------------- optional repository variables --------------
 # | Variable               | Default              | Meaning                    |
 # |------------------------|----------------------|----------------------------|
-# | AZURE_RESOURCE_GROUP   | opsbridge365-rg      | Target resource group      |
+# | AZURE_RESOURCE_GROUP   | rg-opsbridge365      | Target resource group      |
 # | AZURE_LOCATION         | eastus               | Region if the RG is new    |
 # | NAME_PREFIX            | opsbridge            | Bicep namePrefix param     |
 #
@@ -256,7 +256,7 @@ jobs:
 
       - name: Ensure resource group
         env:
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'opsbridge365-rg' }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}
           LOCATION: ${{ vars.AZURE_LOCATION || 'eastus' }}
         run: |
           set -euo pipefail
@@ -269,7 +269,7 @@ jobs:
       - name: Deploy infra/main.bicep
         id: infra
         env:
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'opsbridge365-rg' }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}
           NAME_PREFIX: ${{ vars.NAME_PREFIX || 'opsbridge' }}
           CONTAINER_IMAGE: ${{ needs.build-and-push.outputs.image }}
           # Secrets reach the CLI through the environment only - never inlined
@@ -342,7 +342,7 @@ jobs:
 
       - name: Verify - sync job exists
         env:
-          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'opsbridge365-rg' }}
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}
           JOB_NAME: ${{ steps.infra.outputs.job-name }}
         run: |
           set -euo pipefail

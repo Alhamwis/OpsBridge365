@@ -23,7 +23,7 @@
 
 .PARAMETER ResourceGroup
     Resource group to delete. Defaults to $env:AZURE_RESOURCE_GROUP, then
-    'opsbridge365-rg'.
+    'rg-opsbridge365'.
 
 .PARAMETER ConfirmResourceGroup
     The typed confirmation. Must equal -ResourceGroup exactly, or the script
@@ -44,7 +44,7 @@
     powershell -NoProfile -File scripts/destroy-cloud.ps1 -WhatIf
 
 .EXAMPLE
-    powershell -NoProfile -File scripts/destroy-cloud.ps1 -ResourceGroup opsbridge365-rg -ConfirmResourceGroup opsbridge365-rg
+    powershell -NoProfile -File scripts/destroy-cloud.ps1 -ResourceGroup rg-opsbridge365 -ConfirmResourceGroup rg-opsbridge365
 #>
 
 [CmdletBinding()]
@@ -74,7 +74,7 @@ if ([string]::IsNullOrWhiteSpace($ResourceGroup)) {
         $ResourceGroup = $env:AZURE_RESOURCE_GROUP
     }
     else {
-        $ResourceGroup = 'opsbridge365-rg'
+        $ResourceGroup = 'rg-opsbridge365'
     }
 }
 
