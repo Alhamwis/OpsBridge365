@@ -88,9 +88,42 @@ pip install -e ".[dev]"
 python -m pytest -q
 ```
 
-Every test runs offline — `httpx` is intercepted by `respx` and MSAL is replaced
-by a stub, so no token request and no Graph call leaves the machine. No
-credentials needed.
+Every test in the default run is offline — `httpx` is intercepted by `respx` and
+MSAL is replaced by a stub, so no token request and no Graph call leaves the
+machine. No credentials needed.
+
+#### Live integration tests (opt-in)
+
+`tests/integration/` holds ten tests that hit the real Microsoft 365 tenant.
+They are **deselected by default** — `addopts = "-ra -m 'not integration'"` in
+`pyproject.toml` — so a bare `python -m pytest` never reaches for a credential.
+Opt in explicitly:
+
+```bash
+pytest -m integration      # only the live tests
+pytest -m ""               # offline + live
+```
+
+They read every value from the environment; nothing tenant-specific is committed:
+
+```bash
+export AZURE_TENANT_ID=...        # the Microsoft 365 tenant, not the Azure one
+export AZURE_CLIENT_ID=...
+export AZURE_CLIENT_SECRET=...    # never commit this, never echo it
+export SHAREPOINT_SITE_ID=...     # hostname,siteGuid,webGuid
+export ASSETS_LIST_ID=...
+export TICKETS_LIST_ID=...
+```
+
+With any of those unset each test **skips with a reason** rather than failing, so
+the suite stays green on a machine with no credentials.
+
+They are safe to re-run. Exactly one test writes — a PATCH round-trip on a single
+Assets row — and it restores the original value in a `finally` block, so the
+lists are left exactly as found. Two are negative tests: a wrong client secret
+must raise `GraphAuthError`, and a request for a site the app was *not* granted
+must return **403**. That 403 is the evidence that `Sites.Selected` is genuinely
+scoped to one site rather than acting as tenant-wide SharePoint access.
 
 ### Run locally
 
@@ -148,7 +181,7 @@ looking good.
 | CI workflow (`ci.yml`) | 🟡 **Implemented, awaiting cloud credentials** | Written and reviewed. **Never executed** — this repository has no git remote, so no run exists on GitHub |
 | Secret scanning (gitleaks, full history) | 🟡 **Implemented, verified locally** | `secret-scan` job in both workflows, hard gate on `build-and-push`. The scan itself was run locally over the full history (gitleaks v8.30.1, 6 commits) and is clean; the *job* has never run on GitHub |
 | Deploy workflow (`deploy.yml`) | 🟡 **Implemented, awaiting cloud credentials** | Same — written, never run. OIDC federation cannot be configured without both accounts |
-| Integration tests against a real tenant | ⛔ **Blocked on human account creation** | Needs a tenant with Graph admin consent granted |
+| Integration tests against a real tenant | 🟡 **Written, not yet executed here** | `tests/integration/test_live_graph.py` — 10 tests, opt-in via `pytest -m integration`. The machine these docs were written on has no credentials in its environment, so they have only been seen to collect and skip, never to pass. Nobody should read this row as "the live tenant is verified" |
 | Azure subscription (Azure for Students) | ⛔ **Blocked on human account creation** | Student identity verification |
 | Own Entra tenant + app registrations | ⛔ **Blocked on human account creation** | Portal tenant creation requires a signed-in human |
 | Microsoft 365 E5 trial (adds SharePoint) | ⛔ **Blocked on human account creation** | Requires a payment method on file |
@@ -161,15 +194,19 @@ looking good.
 
 ```
 $ python -m pytest -q
-.........................................................                [100%]
-57 passed in 1.71s
+..........................................................               [100%]
+58 passed, 10 deselected in 1.82s
 ```
+
+The 10 deselected are the live integration tests (see Quickstart). The 58 that
+ran needed no network and no credentials.
 
 Two things this table deliberately does *not* claim: there is no measured cold
 start time, no uptime figure, and no throughput number anywhere in this
 repository, because nothing has run in Azure to measure. And `opsbridge-state.json`
 is a build-tracking artifact that has drifted — it still marks Docker, Bicep and
-the workflows `NOT_STARTED` and the test count as 56. This table and the repo are
+the workflows `NOT_STARTED`, the test count as 56, and the integration tests
+as blocked on a tenant that now exists. This table and the repo are
 authoritative over it.
 
 ---
@@ -182,7 +219,7 @@ authoritative over it.
 | API | FastAPI + uvicorn |
 | HTTP / auth | httpx (async), MSAL client-credentials flow |
 | Validation | Pydantic v2, pydantic-settings |
-| Tests | pytest, pytest-asyncio, respx — 57 tests, all offline |
+| Tests | pytest, pytest-asyncio, respx — 58 offline tests, plus 10 opt-in live tests |
 | Lint | ruff (`E`, `F`, `I`, `UP`, `B`, line length 100) |
 | Container | Multi-stage Dockerfile on `python:3.12-slim`, non-root uid 10001 |
 | Infrastructure | Bicep, one file, resource-group scope |
@@ -203,7 +240,8 @@ app/                    the service
   metrics.py            pure SLA computation, no I/O
   models.py             Pydantic models for Graph, lists, responses
   main.py               FastAPI app - /healthz, /metrics
-tests/                  57 offline tests
+tests/                  58 offline tests
+  integration/          10 live tenant tests, deselected by default
 infra/                  main.bicep + parameter example + infra/README.md
 .github/workflows/      ci.yml (PR) and deploy.yml (main)
 scripts/                deploy / verify / destroy + SharePoint provisioning

@@ -114,8 +114,8 @@ az ad app federated-credential create --id "$DEPLOY_APP_ID" --parameters federat
 #
 #    These use `az rest`, not `az role assignment create`, on purpose - see
 #    "Workaround: az role assignment fails with MissingSubscription" below.
-az group create -n opsbridge365-rg -l eastus
-RG=$(az group show -n opsbridge365-rg --query id -o tsv)
+az group create -n rg-opsbridge365 -l eastus
+RG=$(az group show -n rg-opsbridge365 --query id -o tsv)
 SUB=$(az account show --query id -o tsv)
 
 # principalId is the service principal's OBJECT id, not the app id.
@@ -266,7 +266,7 @@ so the workflow runs with none of them set.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AZURE_RESOURCE_GROUP` | `opsbridge365-rg` | Resource group the deployment targets |
+| `AZURE_RESOURCE_GROUP` | `rg-opsbridge365` | Resource group the deployment targets |
 | `AZURE_LOCATION` | `eastus` | Region used if the group has to be created |
 | `NAME_PREFIX` | `opsbridge` | Bicep `namePrefix` — prefixes every resource name |
 
@@ -325,9 +325,9 @@ Both write their result to the run's job summary.
 
 ```bash
 az login
-az group create -n opsbridge365-rg -l eastus
+az group create -n rg-opsbridge365 -l eastus
 az deployment group create \
-  -g opsbridge365-rg \
+  -g rg-opsbridge365 \
   -f infra/main.bicep \
   -p @infra/main.parameters.example.json \
   -p containerImage='ghcr.io/OWNER/opsbridge365:latest'
@@ -495,9 +495,9 @@ PASS and every cloud check as SKIP with the reason — which is the honest pictu
 Manual equivalents:
 
 ```powershell
-az deployment group show -g opsbridge365-rg -n <deployment> --query properties.outputs
-az containerapp job start -g opsbridge365-rg -n opsbridge-sync        # don't wait for cron
-az containerapp job execution list -g opsbridge365-rg -n opsbridge-sync -o table
+az deployment group show -g rg-opsbridge365 -n <deployment> --query properties.outputs
+az containerapp job start -g rg-opsbridge365 -n opsbridge-sync        # don't wait for cron
+az containerapp job execution list -g rg-opsbridge365 -n opsbridge-sync -o table
 curl https://<apiFqdn>/healthz
 curl https://<apiFqdn>/metrics
 ```
@@ -519,7 +519,7 @@ subscription, so neither has been run.
 
 ```powershell
 powershell -NoProfile -File scripts/destroy-cloud.ps1 -WhatIf
-powershell -NoProfile -File scripts/destroy-cloud.ps1 -ResourceGroup opsbridge365-rg -ConfirmResourceGroup opsbridge365-rg -PurgeKeyVault
+powershell -NoProfile -File scripts/destroy-cloud.ps1 -ResourceGroup rg-opsbridge365 -ConfirmResourceGroup rg-opsbridge365 -PurgeKeyVault
 ```
 
 Deletes the whole resource group — the entire cloud layer, and nothing outside it.
@@ -538,8 +538,8 @@ Revisions are immutable and tagged by commit sha, so rolling back is redeploying
 known-good sha:
 
 ```powershell
-az containerapp revision list -g opsbridge365-rg -n opsbridge-api -o table
-az containerapp update -g opsbridge365-rg -n opsbridge-api --image ghcr.io/<owner>/opsbridge365:<good-sha>
+az containerapp revision list -g rg-opsbridge365 -n opsbridge-api -o table
+az containerapp update -g rg-opsbridge365 -n opsbridge-api --image ghcr.io/<owner>/opsbridge365:<good-sha>
 ```
 
 The sync job is idempotent — it PATCHes by list item id — so re-running an older
