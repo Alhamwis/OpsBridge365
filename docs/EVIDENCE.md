@@ -51,7 +51,9 @@ page.
 
 | Check | Command | Result |
 | --- | --- | --- |
-| Test suite | `python -m pytest -q` | `57 passed in 1.71s` |
+| Test suite (offline) | `python -m pytest -q` | `58 passed, 10 deselected in 1.82s` |
+| Live tenant tests collect | `python -m pytest -m integration --collect-only -q` | `10/68 tests collected (58 deselected)` |
+| Live tenant tests skip cleanly with no credentials | `python -m pytest -m integration -q` | `10 skipped, 58 deselected` — they have **not** been seen to pass; no credentials were present on this machine |
 | Bicep template compiles | `bicep build infra/main.bicep --stdout` | Exit 0, **zero diagnostics**, 14,610-byte ARM template. Bicep CLI 0.46.1 |
 | `.gitignore` was the first commit | `git show --stat $(git rev-list --max-parents=0 HEAD)` | `50f92b7` — one file changed, `.gitignore`, 19 insertions |
 | No git remote exists | `git remote -v` | Empty — which is why no workflow has ever run |
@@ -120,7 +122,7 @@ Said plainly, so nobody has to infer it from an absence:
 Offline, on any machine with Python 3.12 and Docker:
 
 ```bash
-python -m pytest -q                                   # 57 passed
+python -m pytest -q                                   # 58 passed, 10 deselected
 bicep build infra/main.bicep --stdout > /dev/null      # 0 diagnostics
 docker build -t opsbridge365:local .
 docker run --rm opsbridge365:local id -u               # 10001

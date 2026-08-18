@@ -15,12 +15,18 @@ Safety: exactly one test writes, and it restores the original value in a
 ``finally`` block, so the suite is safe to re-run and leaves the lists byte-for
 -byte as it found them.
 
-The last two tests are negative on purpose. Test 9 proves bad credentials
-surface as a typed :class:`GraphAuthError` rather than a stack trace. Test 10 is
-the least-privilege evidence: the app holds ``Sites.Selected`` with a ``write``
-grant on ONE site, so a request for a site it was never granted must come back
-403. A passing test 10 is what distinguishes ``Sites.Selected`` from the
-tenant-wide ``Sites.ReadWrite.All`` it is often mistaken for.
+Test 9 is negative on purpose: it proves bad credentials surface as a typed
+:class:`GraphAuthError` rather than a stack trace.
+
+Tests 10-12 are the least-privilege evidence, and they are deliberately aimed at
+the boundary ``Sites.Selected`` actually enforces. Measured against a correctly
+configured tenant, an ungranted site's *metadata* is readable (``GET
+/sites/{hostname}`` returns 200); what is refused is that site's **data**
+(``/drive`` -> 403) and **tenant-wide enumeration** (``/sites?search=*`` -> 403).
+So test 10 asserts denial on data, test 11 asserts denial on enumeration, and
+test 12 is the positive control proving the same calls succeed on the one site
+the app was granted. A denial that is never contrasted with a success proves
+nothing.
 """
 
 from __future__ import annotations
@@ -239,30 +245,119 @@ async def test_wrong_client_secret_raises_graph_auth_error(live_settings: Settin
     assert "AADSTS7000215" in str(caught.value) or "invalid_client" in str(caught.value)
 
 
-# 10. negative: Sites.Selected is genuinely scoped -----------------------------
+# 10. negative: an ungranted site's DATA is denied -----------------------------
 
 
-async def test_ungranted_site_returns_403(live_graph: GraphClient) -> None:
-    """The least-privilege proof.
+def _site_guids(site_id: str) -> str:
+    """The ``siteGuid,webGuid`` tail of a Graph site id, lowercased."""
+    return ",".join(part.strip() for part in site_id.split(",")[1:]).lower()
 
-    ``Sites.Selected`` carries no site access by itself - access comes from
-    per-site grants, and this app has exactly one. Asking for the tenant ROOT
-    site, which was never granted, must be refused with 403. If this ever
-    returns 200 the app is holding tenant-wide SharePoint access and the
-    security claim in docs/SECURITY.md is false.
+
+async def _root_site_id(graph: GraphClient) -> str:
+    """Resolve the tenant root site, skipping the test if it cannot be isolated.
 
     The hostname is derived from the configured site id (Graph site ids are
-    ``hostname,siteGuid,webGuid``) so no tenant name is hardcoded.
+    ``hostname,siteGuid,webGuid``) so no tenant name is hardcoded here.
+
+    Resolving the root site by hostname is expected to SUCCEED. That is not a
+    finding - see :func:`test_ungranted_site_data_is_denied` for why.
     """
-    hostname = live_graph.settings.sharepoint_site_id.split(",")[0].strip()
+    hostname = graph.settings.sharepoint_site_id.split(",")[0].strip()
     if not hostname or "." not in hostname:
         pytest.skip(f"cannot derive a hostname from SHAREPOINT_SITE_ID: {hostname!r}")
 
+    root = await graph.request_json("GET", f"{GRAPH_BASE_URL}/sites/{hostname}")
+    root_id = str(root.get("id") or "")
+    if not root_id:
+        pytest.skip(f"root site {hostname} returned no id to test against")
+
+    # If the granted site IS the root site there is no ungranted site to probe
+    # and the denial tests would be measuring the granted site instead.
+    granted_guids = _site_guids(graph.settings.sharepoint_site_id)
+    if granted_guids and granted_guids == _site_guids(root_id):
+        pytest.skip(
+            "SHAREPOINT_SITE_ID is the tenant root site; there is no ungranted "
+            "site to prove denial against"
+        )
+    return root_id
+
+
+async def test_ungranted_site_data_is_denied(live_graph: GraphClient) -> None:
+    """The least-privilege proof: no DATA access outside the granted site.
+
+    ``Sites.Selected`` does **not** hide a site's existence. Site *metadata* -
+    id, webUrl, displayName - stays readable for a site this app was never
+    granted; ``GET /sites/{hostname}`` on the tenant root returns 200, and that
+    is expected Microsoft behaviour, not a misconfiguration. Measured against
+    the live tenant, an ungranted root site also returns 200 on ``/lists`` while
+    disclosing zero lists.
+
+    What ``Sites.Selected`` withholds is the site's **content**. ``/drive`` on
+    an ungranted site is refused with 403, and that is the property the security
+    claim in docs/SECURITY.md rests on. So this test asserts on ``/drive``, not
+    on metadata.
+
+    Do not "fix" this back into asserting 403 on ``GET /sites/{hostname}``. That
+    assertion fails against a *correctly* configured tenant, because metadata
+    visibility is not the boundary being enforced.
+    """
+    root_id = await _root_site_id(live_graph)
+
     with pytest.raises(GraphHTTPError) as caught:
-        await live_graph.request_json("GET", f"{GRAPH_BASE_URL}/sites/{hostname}")
+        await live_graph.request_json("GET", f"{GRAPH_BASE_URL}/sites/{root_id}/drive")
 
     assert caught.value.status_code == 403, (
-        f"expected 403 for the ungranted root site {hostname}, got "
-        f"{caught.value.status_code}. A 200 means the app has broader SharePoint "
-        "access than Sites.Selected plus one grant."
+        "expected 403 reading the ungranted root site's drive, got "
+        f"{caught.value.status_code}. A 200 means the app can read content on a "
+        "site it was never granted, and the Sites.Selected claim is false."
+    )
+
+
+# 11. negative: the app cannot enumerate the tenant ----------------------------
+
+
+async def test_tenant_wide_site_enumeration_is_denied(live_graph: GraphClient) -> None:
+    """The strongest single proof that the app cannot roam the tenant.
+
+    Metadata for a site whose id you already hold is readable (see
+    :func:`test_ungranted_site_data_is_denied`), so "can it see other sites?" is
+    the wrong question. The one that matters is whether it can *discover* them:
+    ``GET /sites?search=*`` is the tenant-wide search that ``Sites.Read.All`` or
+    ``Sites.ReadWrite.All`` would satisfy. Under ``Sites.Selected`` it is
+    refused with 403, so the app cannot build a list of sites to attack.
+
+    A 200 here - even with an empty result set - means the app holds a
+    tenant-wide SharePoint permission it was never meant to have.
+    """
+    with pytest.raises(GraphHTTPError) as caught:
+        await live_graph.request_json("GET", f"{GRAPH_BASE_URL}/sites", params={"search": "*"})
+
+    assert caught.value.status_code == 403, (
+        f"expected 403 for tenant-wide site search, got {caught.value.status_code}. "
+        "Anything other than 403 means the app can enumerate the tenant's sites."
+    )
+
+
+# 12. positive control for the two denials above -------------------------------
+
+
+async def test_granted_site_data_is_accessible(live_graph: GraphClient) -> None:
+    """The control that gives the two denial tests their meaning.
+
+    A 403 proves nothing on its own - a broken secret, a typo'd url or a
+    revoked consent would produce the same 403 everywhere and make tests 10 and
+    11 pass for entirely the wrong reason. This asserts the *same shape of call*
+    succeeds on the one site the app was granted: ``/lists`` returns 200 and the
+    provisioned Assets list is among the results.
+
+    Read together: data access works where a grant exists and is refused where
+    it does not. That contrast is the least-privilege evidence.
+    """
+    lists = await live_graph.get_paged(f"{_site_url(live_graph.settings)}/lists")
+
+    assert lists, "the granted site disclosed zero lists; the write grant is not in effect"
+    assert any(entry.get("id") == live_graph.settings.assets_list_id for entry in lists), (
+        "the granted site's /lists did not include ASSETS_LIST_ID "
+        f"({live_graph.settings.assets_list_id}); ids seen: "
+        f"{[entry.get('id') for entry in lists]}"
     )

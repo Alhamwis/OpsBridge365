@@ -4,10 +4,14 @@ Threat model and controls for the OpsBridge365 cloud layer.
 
 > **Scope note.** Everything below describes controls that are **implemented in
 > the repository** — in the Bicep template, the workflows, the Dockerfile and the
-> code. None of it has been exercised against a live Azure subscription or tenant,
-> because neither exists yet. A control that is designed and committed is not the
-> same as a control that has been observed working, and this document marks which
-> is which. Anything not implemented is listed under [Gaps](#gaps-what-is-not-done).
+> code. Nothing has been exercised against a live **Azure subscription**, because
+> none exists yet. The **Microsoft 365 tenant side is different**: the Graph
+> permissions and the `Sites.Selected` boundary have now been probed directly with
+> the app's own token, and the measured results are in
+> [What `Sites.Selected` does and does not hide](#what-sitesselected-does-and-does-not-hide).
+> A control that is designed and committed is not the same as a control that has
+> been observed working, and this document marks which is which. Anything not
+> implemented is listed under [Gaps](#gaps-what-is-not-done).
 
 ---
 
@@ -107,6 +111,56 @@ grants nothing on its own: after consent, an admin authorizes the app on
 individual sites via `POST /sites/{site-id}/permissions` with `"roles": ["write"]`.
 The blast radius of the one stored secret is then a single site, not a tenant's
 entire SharePoint estate. That is the stricter choice and it is the one specified.
+
+#### What `Sites.Selected` does and does not hide
+
+This is a non-obvious boundary and it is easy to overclaim, so here is what was
+**measured** against the live tenant with the app's own token (`opsbridge-graph`,
+`Sites.Selected` + one `write` grant):
+
+| Request | Result | What it means |
+| --- | --- | --- |
+| `GET /sites/{granted}` | **200** | The granted site resolves |
+| `GET /sites/{granted}/lists` | **200**, 3 lists | Granted-site data is readable |
+| `GET /sites/{granted}/lists/{assets}/items` | **200**, 4 items | The sync job's actual read path works |
+| `GET /sites/{rootHost}` | **200** | **Metadata of an ungranted site is readable** |
+| `GET /sites/{rootId}/lists` | **200**, **zero** lists | Reachable, but discloses nothing |
+| `GET /sites/{rootId}/drive` | **403** `accessDenied` | Ungranted-site *data* is refused |
+| `GET /sites/{rootId}/drive/root/children` | **403** `accessDenied` | Same |
+| `GET /sites?search=*` | **403** `accessDenied` | No tenant-wide search |
+| `GET /sites/getAllSites` | **403** `accessDenied` | No tenant-wide enumeration |
+
+Read plainly: **`Sites.Selected` does not hide a site's existence or its basic
+metadata.** For a site the app was never granted, `GET /sites/{hostname}` returns
+200 with the site's id, `webUrl` and display name. That is expected Microsoft
+behaviour, not a misconfiguration in this tenant, and it is not something a
+per-site grant model was ever designed to prevent.
+
+What the permission actually withholds — and what the security posture here
+relies on — is two things:
+
+1. **Data access.** Content on an ungranted site (`/drive`, drive children) is
+   refused with `403 accessDenied`. `/lists` on the ungranted root site returns
+   200 but discloses no lists, so there is nothing to read even where the call
+   itself is permitted.
+2. **Enumeration.** Both tenant-wide discovery paths — `/sites?search=*` and
+   `/sites/getAllSites` — are refused with `403 accessDenied`. The app cannot
+   build a list of sites to go after; it can only address a site whose id it was
+   already given.
+
+So the accurate claim is *"the app cannot read data on, or discover, any site
+other than the one it was granted"* — **not** *"the app cannot see other sites."*
+The latter is false, and stating it would be an overclaim that a reviewer with a
+token could disprove in one request.
+
+This is also why `tests/integration/test_live_graph.py` asserts denial on
+`/sites/{rootId}/drive` and on `/sites?search=*` rather than on
+`GET /sites/{hostname}`. An earlier version of that test asserted 403 on the
+ungranted site's *metadata* and consequently **failed against a correctly
+configured tenant** — the security property was real, the assertion was aimed at
+the wrong surface. Each of those tests now carries a docstring saying so, and
+there is a positive control (`test_granted_site_data_is_accessible`) because a
+403 proves nothing unless the same call is shown to succeed where a grant exists.
 
 **`Device.Read.All` is the directory permission, deliberately.** `app/graph.py:
 list_devices` calls `GET /devices` — the directory device object — so that is the

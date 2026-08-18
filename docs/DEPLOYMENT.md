@@ -358,7 +358,7 @@ belongs on the command line or in Key Vault, never in a committed file.
 - `infra/main.bicep` **compiles clean** (`bicep build infra/main.bicep`, Bicep CLI
   0.46.1, zero diagnostics) but has never been submitted to ARM — not even with
   `--what-if`, which requires an authenticated subscription.
-- The container image builds and runs locally; the test suite passes (57 tests).
+- The container image builds and runs locally; the test suite passes (58 offline tests; 10 live tests are opt-in via `pytest -m integration`).
 
 Every step in Phase 1 below is blocked on a human creating an account. None of it
 can be automated, which is why it is listed separately and first.
@@ -506,7 +506,7 @@ curl https://<apiFqdn>/metrics
 
 ```bash
 bicep build infra/main.bicep --stdout > /dev/null   # compiles clean, 0 diagnostics
-python -m pytest -q                                 # 57 passed
+python -m pytest -q                                 # 58 passed, 10 deselected
 docker build -t opsbridge365:local .
 ```
 

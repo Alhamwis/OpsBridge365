@@ -72,13 +72,21 @@ python -m pytest -q
 ```
 
 ```
-57 passed in 1.71s
+58 passed, 10 deselected in 1.82s
 ```
 
-> "Fifty-seven tests, all offline — httpx is intercepted and MSAL is stubbed, so no
+> "Fifty-eight tests, all offline — httpx is intercepted and MSAL is stubbed, so no
 > test ever needs a credential or touches the network. That includes the retry
 > path: 429 and 503 with `Retry-After` honoured, timeouts, transport errors, and
 > malformed JSON."
+
+Then point at the ten deselected:
+
+> "Those ten are the live tests — they hit the real tenant, so they're opt-in with
+> `pytest -m integration`, never in the default run. The one I'd show a security
+> reviewer asks Graph for a site the app was never granted and asserts a 403. That
+> is the difference between `Sites.Selected` and tenant-wide access, and it's an
+> assertion rather than a paragraph in a document."
 
 Then open `app/metrics.py` and point at one line:
 
