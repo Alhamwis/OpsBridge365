@@ -24,6 +24,18 @@
     Azure resource group to inspect. Defaults to $env:AZURE_RESOURCE_GROUP, then
     'rg-opsbridge365' (the default used by .github/workflows/deploy.yml).
 
+.PARAMETER SubscriptionId
+    Subscription holding that resource group. Defaults to
+    $env:AZURE_SUBSCRIPTION_ID, and when neither is given, every subscription
+    this login can see is searched for the group.
+
+    Worth being explicit about why this is not just "the current subscription":
+    this project spans two tenants, and signing in to do Graph work changes the
+    Azure CLI default. A report that trusted the default once concluded
+    "nothing is deployed yet" about a resource group that was deployed and
+    healthy in the other subscription. Every cloud check below now names the
+    subscription it looked in.
+
 .PARAMETER NamePrefix
     Bicep namePrefix, used to derive the app and job names. Default 'opsbridge'.
 
@@ -49,6 +61,7 @@
 [CmdletBinding()]
 param(
     [string] $ResourceGroup,
+    [string] $SubscriptionId,
     [string] $NamePrefix = 'opsbridge',
     [string] $ImageTag = 'opsbridge365:local',
     [int]    $Port = 8000,
@@ -74,6 +87,16 @@ if (-not (Test-Path -LiteralPath $AzHelperPath)) {
     exit 1
 }
 . $AzHelperPath
+
+# Shared subscription resolution - see scripts/Resolve-AzSubscription.ps1 for
+# why the ambient az default is not a safe answer in this project.
+$SubHelperPath = Join-Path -Path $PSScriptRoot -ChildPath 'Resolve-AzSubscription.ps1'
+if (-not (Test-Path -LiteralPath $SubHelperPath)) {
+    Write-Host "Missing helper: $SubHelperPath" -ForegroundColor Red
+    Write-Host 'Run this script from a full checkout of the repository.' -ForegroundColor Yellow
+    exit 1
+}
+. $SubHelperPath
 
 if ([string]::IsNullOrWhiteSpace($ResourceGroup)) {
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_RESOURCE_GROUP)) {
@@ -241,6 +264,73 @@ Write-Host '================================================================' -F
 Write-Host (" repo           : {0}" -f $RepoRoot)
 Write-Host (" resource group : {0}" -f $ResourceGroup)
 Write-Host (" api / job      : {0} / {1}" -f $ApiName, $JobName)
+
+# The Azure identity work happens here, before the sections, for one reason:
+# the reader has to know which subscription the cloud rows describe before they
+# read them. The findings are only recorded as report rows later, in the Azure
+# section, so the table keeps its order.
+$AzCli = Resolve-AzCli
+$azPresent = -not [string]::IsNullOrWhiteSpace($AzCli)
+$azVersionText = ''
+$loggedIn = $false
+$defaultSubscription = ''
+$azSkipReason = ''
+$Sub = $null
+$SubscriptionArgs = @()
+
+if (-not $azPresent) {
+    $azSkipReason = Get-AzCliNotFoundDetail
+}
+else {
+    # Also proves the resolved path actually runs. A file that exists but
+    # cannot execute is not a working CLI, and reporting PASS on the strength
+    # of Test-Path alone would be the same class of lie as reporting "not
+    # installed" for something that is installed.
+    # -o json, not --query: 'azure-cli' contains a hyphen, and the JMESPath
+    # quoting that needs does not survive being passed to az.bat (exit 2).
+    $azVersion = Invoke-Native -FilePath $AzCli -CommandArgs @('version', '--only-show-errors', '-o', 'json')
+    if ($azVersion.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($azVersion.Output)) {
+        try {
+            $parsedVersion = $azVersion.Output | ConvertFrom-Json
+            $azVersionText = [string]$parsedVersion.'azure-cli'
+        }
+        catch {
+            $azVersionText = ''
+        }
+    }
+
+    $account = Invoke-Native -FilePath $AzCli -CommandArgs @('account', 'show', '--only-show-errors', '-o', 'json')
+    if ($account.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($account.Output)) {
+        try {
+            $parsedAccount = $account.Output | ConvertFrom-Json
+            $loggedIn = $true
+            $defaultSubscription = [string]$parsedAccount.name
+        }
+        catch {
+            $azSkipReason = 'az account show returned unparseable JSON'
+        }
+    }
+    else {
+        $azSkipReason = 'not logged in - run: az login'
+    }
+}
+
+if ($loggedIn) {
+    Write-Host "  resolving which subscription holds $ResourceGroup ..." -ForegroundColor DarkGray
+    $Sub = Resolve-AzSubscription -AzCli $AzCli -ResourceGroup $ResourceGroup -SubscriptionId $SubscriptionId
+    if ($Sub.Status -eq 'Resolved') {
+        # Every az call below is pinned to this, so the report cannot drift
+        # onto another subscription halfway through.
+        $SubscriptionArgs = @('--subscription', $Sub.Id)
+        Write-Host (" subscription   : {0} ({1})" -f $Sub.Name, $Sub.Id)
+    }
+    else {
+        Write-Host (" subscription   : unresolved - {0}" -f $Sub.Detail) -ForegroundColor Yellow
+    }
+}
+else {
+    Write-Host ' subscription   : not determined (no usable az login)'
+}
 
 Push-Location $RepoRoot
 try {
@@ -440,76 +530,75 @@ try {
     # Two distinct states, never conflated:
     #   az unresolvable  -> cannot check at all
     #   az present, no login -> could check, is not authorised to
-    # The SKIP detail says which one was hit.
-    $AzCli = Resolve-AzCli
-    $azPresent = -not [string]::IsNullOrWhiteSpace($AzCli)
-    $loggedIn = $false
-    $skipReason = ''
-
+    # The SKIP detail says which one was hit. Both were determined above the
+    # sections so the header could name the subscription; only the reporting
+    # happens here, which keeps the table in reading order.
     if (-not $azPresent) {
-        $skipReason = Get-AzCliNotFoundDetail
-        Add-Result -Check 'az CLI present' -Status 'SKIP' -Detail $skipReason
+        Add-Result -Check 'az CLI present' -Status 'SKIP' -Detail $azSkipReason
     }
     else {
-        # Also proves the resolved path actually runs. A file that exists but
-        # cannot execute is not a working CLI, and reporting PASS on the
-        # strength of Test-Path alone would be the same class of lie as
-        # reporting "not installed" for something that is installed.
-        # -o json, not --query: 'azure-cli' contains a hyphen, and the JMESPath
-        # quoting that needs does not survive being passed to az.bat (exit 2).
-        $versionText = ''
-        $azVersion = Invoke-Native -FilePath $AzCli -CommandArgs @('version', '--only-show-errors', '-o', 'json')
-        if ($azVersion.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($azVersion.Output)) {
-            try {
-                $parsedVersion = $azVersion.Output | ConvertFrom-Json
-                $versionText = [string]$parsedVersion.'azure-cli'
-            }
-            catch {
-                $versionText = ''
-            }
-        }
-        if ([string]::IsNullOrWhiteSpace($versionText)) {
+        if ([string]::IsNullOrWhiteSpace($azVersionText)) {
             Add-Result -Check 'az CLI present' -Status 'PASS' -Detail $AzCli
         }
         else {
-            Add-Result -Check 'az CLI present' -Status 'PASS' -Detail "azure-cli $versionText at $AzCli"
+            Add-Result -Check 'az CLI present' -Status 'PASS' -Detail "azure-cli $azVersionText at $AzCli"
         }
 
-        $account = Invoke-Native -FilePath $AzCli -CommandArgs @('account', 'show', '--only-show-errors', '-o', 'json')
-        if ($account.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($account.Output)) {
-            try {
-                $parsed = $account.Output | ConvertFrom-Json
-                $loggedIn = $true
-                Add-Result -Check 'az logged in' -Status 'PASS' -Detail "subscription: $($parsed.name)"
-            }
-            catch {
-                $skipReason = 'az account show returned unparseable JSON'
-                Add-Result -Check 'az logged in' -Status 'SKIP' -Detail $skipReason
-            }
+        if ($loggedIn) {
+            # Reported as the DEFAULT subscription, not as the one being
+            # checked. In this project they are routinely different, and
+            # conflating them is precisely the defect this parameter fixes.
+            Add-Result -Check 'az logged in' -Status 'PASS' -Detail "default subscription: $defaultSubscription"
         }
         else {
-            $skipReason = 'not logged in - run: az login'
-            Add-Result -Check 'az logged in' -Status 'SKIP' -Detail $skipReason
+            Add-Result -Check 'az logged in' -Status 'SKIP' -Detail $azSkipReason
         }
     }
 
+    $subResolved = ($null -ne $Sub -and $Sub.Status -eq 'Resolved')
+
     if (-not $loggedIn) {
+        $skipReason = $azSkipReason
         if ([string]::IsNullOrWhiteSpace($skipReason)) {
             $skipReason = 'unauthenticated'
         }
+        Add-Result -Check 'subscription resolved' -Status 'SKIP' -Detail $skipReason
         Add-Result -Check 'resource group exists' -Status 'SKIP' -Detail $skipReason
         Add-Result -Check 'deployed API /healthz' -Status 'SKIP' -Detail $skipReason
         Add-Result -Check 'sync job exists' -Status 'SKIP' -Detail $skipReason
         Add-Result -Check 'sync job last run' -Status 'SKIP' -Detail $skipReason
     }
-    else {
-        $rg = Invoke-Native -FilePath $AzCli -CommandArgs @('group', 'exists', '--name', $ResourceGroup, '--only-show-errors', '-o', 'tsv')
-        $rgExists = ($rg.ExitCode -eq 0 -and $rg.Output.Trim() -eq 'true')
-        if ($rgExists) {
-            Add-Result -Check 'resource group exists' -Status 'PASS' -Detail $ResourceGroup
+    elseif (-not $subResolved) {
+        # Ambiguous is a WARN rather than a SKIP: two resource groups of the
+        # same name in two subscriptions is a real finding about the
+        # environment, not merely a check that could not run.
+        $subStatus = 'SKIP'
+        if ($Sub.Status -eq 'Ambiguous') { $subStatus = 'WARN' }
+        Add-Result -Check 'subscription resolved' -Status $subStatus -Detail $Sub.Detail
+
+        if ($Sub.Status -eq 'NotFound') {
+            # The searched subscriptions did not have it. That is all this run
+            # established, and it is all the row claims.
+            Add-Result -Check 'resource group exists' -Status 'SKIP' -Detail $Sub.Detail
         }
         else {
-            Add-Result -Check 'resource group exists' -Status 'SKIP' -Detail "$ResourceGroup not found - nothing is deployed yet"
+            Add-Result -Check 'resource group exists' -Status 'SKIP' -Detail 'no single subscription to look in'
+        }
+        Add-Result -Check 'deployed API /healthz' -Status 'SKIP' -Detail 'no resolved subscription'
+        Add-Result -Check 'sync job exists' -Status 'SKIP' -Detail 'no resolved subscription'
+        Add-Result -Check 'sync job last run' -Status 'SKIP' -Detail 'no resolved subscription'
+    }
+    else {
+        Add-Result -Check 'subscription resolved' -Status 'PASS' -Detail $Sub.Detail
+
+        $rg = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+                'group', 'exists', '--name', $ResourceGroup, '--only-show-errors', '-o', 'tsv') + $SubscriptionArgs)
+        $rgExists = ($rg.ExitCode -eq 0 -and $rg.Output.Trim() -eq 'true')
+        if ($rgExists) {
+            Add-Result -Check 'resource group exists' -Status 'PASS' -Detail "$ResourceGroup in $($Sub.Name)"
+        }
+        else {
+            Add-Result -Check 'resource group exists' -Status 'SKIP' -Detail "$ResourceGroup not found in subscription $($Sub.Name) ($($Sub.Id))"
         }
 
         $hasExtension = $false
@@ -521,9 +610,10 @@ try {
         }
 
         if (-not $rgExists) {
-            Add-Result -Check 'deployed API /healthz' -Status 'SKIP' -Detail 'no resource group'
-            Add-Result -Check 'sync job exists' -Status 'SKIP' -Detail 'no resource group'
-            Add-Result -Check 'sync job last run' -Status 'SKIP' -Detail 'no resource group'
+            $noRg = "no resource group $ResourceGroup in subscription $($Sub.Name)"
+            Add-Result -Check 'deployed API /healthz' -Status 'SKIP' -Detail $noRg
+            Add-Result -Check 'sync job exists' -Status 'SKIP' -Detail $noRg
+            Add-Result -Check 'sync job last run' -Status 'SKIP' -Detail $noRg
         }
         elseif (-not $hasExtension) {
             $hint = 'containerapp extension missing - run: az extension add --name containerapp'
@@ -532,9 +622,9 @@ try {
             Add-Result -Check 'sync job last run' -Status 'SKIP' -Detail $hint
         }
         else {
-            $fqdnResult = Invoke-Native -FilePath $AzCli -CommandArgs @(
-                'containerapp', 'show', '--resource-group', $ResourceGroup, '--name', $ApiName,
-                '--query', 'properties.configuration.ingress.fqdn', '--only-show-errors', '-o', 'tsv')
+            $fqdnResult = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+                    'containerapp', 'show', '--resource-group', $ResourceGroup, '--name', $ApiName,
+                    '--query', 'properties.configuration.ingress.fqdn', '--only-show-errors', '-o', 'tsv') + $SubscriptionArgs)
             $fqdn = $fqdnResult.Output.Trim()
 
             if ($fqdnResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($fqdn)) {
@@ -552,9 +642,9 @@ try {
                 }
             }
 
-            $job = Invoke-Native -FilePath $AzCli -CommandArgs @(
-                'containerapp', 'job', 'show', '--resource-group', $ResourceGroup, '--name', $JobName,
-                '--query', 'properties.configuration.triggerType', '--only-show-errors', '-o', 'tsv')
+            $job = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+                    'containerapp', 'job', 'show', '--resource-group', $ResourceGroup, '--name', $JobName,
+                    '--query', 'properties.configuration.triggerType', '--only-show-errors', '-o', 'tsv') + $SubscriptionArgs)
             $trigger = $job.Output.Trim()
 
             if ($job.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($trigger)) {
@@ -569,9 +659,9 @@ try {
                     Add-Result -Check 'sync job exists' -Status 'FAIL' -Detail "$JobName triggerType=$trigger (expected Schedule)"
                 }
 
-                $executions = Invoke-Native -FilePath $AzCli -CommandArgs @(
-                    'containerapp', 'job', 'execution', 'list', '--resource-group', $ResourceGroup,
-                    '--name', $JobName, '--only-show-errors', '-o', 'json')
+                $executions = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+                        'containerapp', 'job', 'execution', 'list', '--resource-group', $ResourceGroup,
+                        '--name', $JobName, '--only-show-errors', '-o', 'json') + $SubscriptionArgs)
                 if ($executions.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($executions.Output)) {
                     Add-Result -Check 'sync job last run' -Status 'SKIP' -Detail 'could not list job executions'
                 }

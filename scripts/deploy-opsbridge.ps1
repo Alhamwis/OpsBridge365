@@ -24,6 +24,17 @@
     Target resource group. Defaults to $env:AZURE_RESOURCE_GROUP, then
     'rg-opsbridge365' (the same default as .github/workflows/deploy.yml).
 
+.PARAMETER SubscriptionId
+    Subscription to deploy into. Defaults to $env:AZURE_SUBSCRIPTION_ID, and
+    when neither is given the resource group is searched for across every
+    subscription this login can see.
+
+    This project spans two tenants, and signing in to do Graph work silently
+    changes the Azure CLI default subscription. Deploying into whichever
+    subscription happened to be selected last is not something to leave to
+    chance, so the resolved subscription is printed and then passed explicitly
+    to every az call below.
+
 .PARAMETER Location
     Region used only if the resource group has to be created. Defaults to
     $env:AZURE_LOCATION, then 'eastus'.
@@ -55,8 +66,8 @@
     Required environment variables (identifiers, except the last one). All of
     them describe the MICROSOFT 365 tenant - the one holding the Graph app
     registration and the SharePoint site - not the Azure tenant that owns the
-    subscription. The Azure side comes from the ambient `az login` context and
-    is never read from the environment here.
+    subscription. The Azure side comes from the `az login` context, narrowed to
+    a single subscription by -SubscriptionId or $env:AZURE_SUBSCRIPTION_ID.
 
       GRAPH_TENANT_ID       tenant the Graph app registration lives in; becomes
                             the Bicep graphTenantId parameter and, at runtime,
@@ -77,6 +88,7 @@
 [CmdletBinding()]
 param(
     [string] $ResourceGroup,
+    [string] $SubscriptionId,
     [string] $Location,
     [string] $NamePrefix = 'opsbridge',
     [string] $ContainerImage,
@@ -100,7 +112,21 @@ if (-not (Test-Path -LiteralPath $AzHelperPath)) {
     exit 1
 }
 . $AzHelperPath
+
+# Shared subscription resolution - see scripts/Resolve-AzSubscription.ps1 for
+# why the ambient az default is not a safe answer in this project.
+$SubHelperPath = Join-Path -Path $PSScriptRoot -ChildPath 'Resolve-AzSubscription.ps1'
+if (-not (Test-Path -LiteralPath $SubHelperPath)) {
+    Write-Host "Missing helper: $SubHelperPath" -ForegroundColor Red
+    Write-Host 'Run this script from a full checkout of the repository.' -ForegroundColor Yellow
+    exit 1
+}
+. $SubHelperPath
+
 $AzCli = ''
+# Appended to every az call once resolved, so a deploy cannot start in one
+# subscription and finish in another.
+$SubscriptionArgs = @()
 
 if ([string]::IsNullOrWhiteSpace($ResourceGroup)) {
     if (-not [string]::IsNullOrWhiteSpace($env:AZURE_RESOURCE_GROUP)) {
@@ -238,7 +264,7 @@ Push-Location $RepoRoot
 try {
 
     # --------------------------------------------------------- preflight ----
-    Write-Step 'Preflight 1/6 - Azure CLI present'
+    Write-Step 'Preflight 1/7 - Azure CLI present'
     $AzCli = Resolve-AzCli
     if ([string]::IsNullOrWhiteSpace($AzCli)) {
         Stop-WithReason -Message 'the Azure CLI (az) could not be resolved.' -Remedy @(
@@ -247,7 +273,7 @@ try {
     }
     Write-Ok "az found: $AzCli"
 
-    Write-Step 'Preflight 2/6 - Azure login'
+    Write-Step 'Preflight 2/7 - Azure login'
     $account = Invoke-Native -FilePath $AzCli -CommandArgs @('account', 'show', '--only-show-errors', '-o', 'json')
     if ($account.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($account.Output)) {
         Stop-WithReason -Message 'the Azure CLI is not logged in.' -Remedy @(
@@ -256,22 +282,59 @@ try {
             'Then: az account set --subscription <subscription-id>',
             'A deploy that starts without an authenticated session can only fail halfway.')
     }
-    $subscriptionName = '(unknown)'
-    $subscriptionId = '(unknown)'
+    # Named "default" throughout: it is where az would go if nothing else were
+    # said, which is not necessarily where this deploy belongs. Step 3 decides
+    # that.
+    $defaultSubscriptionName = '(unknown)'
+    $defaultSubscriptionId = '(unknown)'
     try {
         $parsedAccount = $account.Output | ConvertFrom-Json
-        $subscriptionName = $parsedAccount.name
-        $subscriptionId = $parsedAccount.id
+        $defaultSubscriptionName = [string]$parsedAccount.name
+        $defaultSubscriptionId = [string]$parsedAccount.id
     }
     catch {
         Stop-WithReason -Message 'az account show returned output this script could not parse.' -Remedy @(
             'Run: az account show',
             'If that fails, re-authenticate with: az login')
     }
-    Write-Ok "logged in to subscription: $subscriptionName"
-    Write-Info "subscription id: $subscriptionId"
+    Write-Ok "logged in - default subscription: $defaultSubscriptionName"
+    Write-Info "default subscription id: $defaultSubscriptionId"
 
-    Write-Step 'Preflight 3/6 - Bicep compiles'
+    Write-Step 'Preflight 3/7 - target subscription'
+    Write-Info "looking for $ResourceGroup across the subscriptions this login can see ..."
+    $sub = Resolve-AzSubscription -AzCli $AzCli -ResourceGroup $ResourceGroup -SubscriptionId $SubscriptionId
+
+    $TargetSubscriptionId = ''
+    $TargetSubscriptionName = ''
+    if ($sub.Status -eq 'Resolved') {
+        $TargetSubscriptionId = $sub.Id
+        $TargetSubscriptionName = $sub.Name
+        Write-Ok "deploying into: $($sub.Name) ($($sub.Id))"
+        Write-Info $sub.Detail
+    }
+    elseif ($sub.Status -eq 'Ambiguous') {
+        Stop-WithReason -Message "the target subscription is ambiguous: $($sub.Detail)" -Remedy @(
+            'Two subscriptions hold a resource group with this name.',
+            'Deploying into the wrong one would update the wrong environment.',
+            "Re-run with: -SubscriptionId <id>")
+    }
+    elseif ($sub.Status -eq 'NotFound') {
+        # A first deploy: nothing to match against, so the default is the only
+        # reasonable choice - but it is stated, not assumed silently.
+        $TargetSubscriptionId = $defaultSubscriptionId
+        $TargetSubscriptionName = $defaultSubscriptionName
+        Write-Info $sub.Detail
+        Write-Ok "first deploy - $ResourceGroup will be CREATED in the default subscription: $defaultSubscriptionName ($defaultSubscriptionId)"
+        Write-Info 'If that is the wrong subscription, stop now and re-run with -SubscriptionId <id>.'
+    }
+    else {
+        Stop-WithReason -Message "the target subscription could not be resolved: $($sub.Detail)" -Remedy @(
+            'Run: az account list -o table',
+            'Then re-run with: -SubscriptionId <id>')
+    }
+    $SubscriptionArgs = @('--subscription', $TargetSubscriptionId)
+
+    Write-Step 'Preflight 4/7 - Bicep compiles'
     if (-not (Test-Path $TemplateFile)) {
         Stop-WithReason -Message "template not found: $TemplateFile" -Remedy @(
             'Run this script from a full checkout of the repository.')
@@ -284,7 +347,7 @@ try {
     }
     Write-Ok 'infra/main.bicep compiles'
 
-    Write-Step 'Preflight 4/6 - tests'
+    Write-Step 'Preflight 5/7 - tests'
     if ($SkipTests) {
         Write-Info 'skipped (-SkipTests)'
     }
@@ -309,7 +372,7 @@ try {
         Write-Ok "pytest green - $passSummary"
     }
 
-    Write-Step 'Preflight 5/6 - configuration'
+    Write-Step 'Preflight 6/7 - configuration'
     if ([string]::IsNullOrWhiteSpace($ContainerImage)) {
         if (-not [string]::IsNullOrWhiteSpace($env:OPSBRIDGE_IMAGE)) {
             $ContainerImage = $env:OPSBRIDGE_IMAGE
@@ -360,7 +423,8 @@ try {
     }
     Write-Ok "containerImage = $ContainerImage"
 
-    Write-Step 'Preflight 6/6 - plan'
+    Write-Step 'Preflight 7/7 - plan'
+    Write-Host "    subscription   : $TargetSubscriptionName ($TargetSubscriptionId)"
     Write-Host "    resource group : $ResourceGroup ($Location)"
     Write-Host "    template       : infra/main.bicep"
     Write-Host "    name prefix    : $NamePrefix"
@@ -370,14 +434,15 @@ try {
 
     # ---------------------------------------------------- resource group ----
     Write-Step 'Resource group'
-    $rgCheck = Invoke-Native -FilePath $AzCli -CommandArgs @('group', 'exists', '--name', $ResourceGroup, '--only-show-errors', '-o', 'tsv')
+    $rgCheck = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+            'group', 'exists', '--name', $ResourceGroup, '--only-show-errors', '-o', 'tsv') + $SubscriptionArgs)
     $rgExists = ($rgCheck.ExitCode -eq 0 -and $rgCheck.Output.Trim() -eq 'true')
 
     if ($rgExists) {
-        Write-Ok "$ResourceGroup already exists"
+        Write-Ok "$ResourceGroup already exists in $TargetSubscriptionName"
     }
     elseif ($WhatIf) {
-        Write-Info "WHAT-IF: would create resource group $ResourceGroup in $Location"
+        Write-Info "WHAT-IF: would create resource group $ResourceGroup in $Location ($TargetSubscriptionName)"
         Write-Info 'WHAT-IF: the deployment preview below cannot run without it, so it is skipped.'
         Write-Host ''
         Write-Host 'WHAT-IF complete. Nothing was created or changed.' -ForegroundColor Yellow
@@ -385,16 +450,16 @@ try {
         exit 0
     }
     else {
-        $created = Invoke-Native -FilePath $AzCli -CommandArgs @(
-            'group', 'create', '--name', $ResourceGroup, '--location', $Location,
-            '--tags', 'project=OpsBridge365', 'managedBy=deploy-opsbridge.ps1',
-            '--only-show-errors', '-o', 'none')
+        $created = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+                'group', 'create', '--name', $ResourceGroup, '--location', $Location,
+                '--tags', 'project=OpsBridge365', 'managedBy=deploy-opsbridge.ps1',
+                '--only-show-errors', '-o', 'none') + $SubscriptionArgs)
         if ($created.ExitCode -ne 0) {
             Stop-WithReason -Message "could not create resource group $ResourceGroup." -Remedy @(
-                "Run: az group create --name $ResourceGroup --location $Location",
+                "Run: az group create --name $ResourceGroup --location $Location --subscription $TargetSubscriptionId",
                 'Check that the signed-in identity has Contributor on the subscription.')
         }
-        Write-Ok "created $ResourceGroup in $Location"
+        Write-Ok "created $ResourceGroup in $Location ($TargetSubscriptionName)"
     }
 
     # ---------------------------------------------------------- deployment --
@@ -416,13 +481,13 @@ try {
         "ticketsListId=$($env:TICKETS_LIST_ID)",
         "syncCron=$SyncCron",
         '--only-show-errors'
-    )
+    ) + $SubscriptionArgs
 
     if ($WhatIf) {
         Write-Step 'Deployment preview (az deployment group create --what-if)'
         Write-Info 'Azure reports the change set; nothing is applied.'
         # Printed, never the parameter values: the secret is in that array.
-        Write-Info "az deployment group create --resource-group $ResourceGroup --template-file infra/main.bicep --what-if"
+        Write-Info "az deployment group create --resource-group $ResourceGroup --subscription $TargetSubscriptionId --template-file infra/main.bicep --what-if"
         $preview = & $AzCli @deployArgs --what-if
         $previewCode = $LASTEXITCODE
         if ($null -ne $preview) {
@@ -445,8 +510,8 @@ try {
         Write-Host ''
         Write-Host "DEPLOYMENT FAILED (az exited $($deploy.ExitCode))." -ForegroundColor Red
         Write-Host 'Inspect it with:' -ForegroundColor Yellow
-        Write-Host "  az deployment group show -g $ResourceGroup -n $deploymentName" -ForegroundColor Yellow
-        Write-Host "  az deployment operation group list -g $ResourceGroup -n $deploymentName" -ForegroundColor Yellow
+        Write-Host "  az deployment group show -g $ResourceGroup -n $deploymentName --subscription $TargetSubscriptionId" -ForegroundColor Yellow
+        Write-Host "  az deployment operation group list -g $ResourceGroup -n $deploymentName --subscription $TargetSubscriptionId" -ForegroundColor Yellow
         Write-Host 'Role assignment propagation can lose a first run; the template is' -ForegroundColor Yellow
         Write-Host 'idempotent, so re-running the exact same command usually succeeds.' -ForegroundColor Yellow
         exit 1
@@ -465,9 +530,9 @@ try {
     # ------------------------------------------------------------- verify --
     Write-Step 'Post-deploy verification 1/2 - GET /healthz'
     if ([string]::IsNullOrWhiteSpace($fqdn)) {
-        $fqdnResult = Invoke-Native -FilePath $AzCli -CommandArgs @(
-            'containerapp', 'show', '--resource-group', $ResourceGroup, '--name', $ApiName,
-            '--query', 'properties.configuration.ingress.fqdn', '--only-show-errors', '-o', 'tsv')
+        $fqdnResult = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+                'containerapp', 'show', '--resource-group', $ResourceGroup, '--name', $ApiName,
+                '--query', 'properties.configuration.ingress.fqdn', '--only-show-errors', '-o', 'tsv') + $SubscriptionArgs)
         if ($fqdnResult.ExitCode -eq 0) {
             $fqdn = $fqdnResult.Output.Trim()
         }
@@ -497,9 +562,9 @@ try {
 
     Write-Step 'Post-deploy verification 2/2 - sync job'
     $jobOk = $false
-    $job = Invoke-Native -FilePath $AzCli -CommandArgs @(
-        'containerapp', 'job', 'show', '--resource-group', $ResourceGroup, '--name', $JobName,
-        '--query', 'properties.configuration.triggerType', '--only-show-errors', '-o', 'tsv')
+    $job = Invoke-Native -FilePath $AzCli -CommandArgs (@(
+            'containerapp', 'job', 'show', '--resource-group', $ResourceGroup, '--name', $JobName,
+            '--query', 'properties.configuration.triggerType', '--only-show-errors', '-o', 'tsv') + $SubscriptionArgs)
     $trigger = $job.Output.Trim()
     if ($job.ExitCode -eq 0 -and $trigger -eq 'Schedule') {
         $jobOk = $true
@@ -514,6 +579,7 @@ try {
     Write-Host '================================================================' -ForegroundColor Cyan
     Write-Host ' RESULT' -ForegroundColor Cyan
     Write-Host '================================================================' -ForegroundColor Cyan
+    Write-Host "  subscription   : $TargetSubscriptionName ($TargetSubscriptionId)"
     Write-Host "  resource group : $ResourceGroup"
     Write-Host "  deployment     : $deploymentName"
     if (-not [string]::IsNullOrWhiteSpace($fqdn)) {
@@ -523,11 +589,11 @@ try {
     Write-Host "  sync job       : $JobName"
     Write-Host ''
     Write-Host '  Run the sync now instead of waiting for the cron:'
-    Write-Host "    az containerapp job start -g $ResourceGroup -n $JobName"
+    Write-Host "    az containerapp job start -g $ResourceGroup -n $JobName --subscription $TargetSubscriptionId"
     Write-Host '  Full report:'
-    Write-Host "    powershell -NoProfile -File scripts/verify-opsbridge.ps1 -ResourceGroup $ResourceGroup"
+    Write-Host "    powershell -NoProfile -File scripts/verify-opsbridge.ps1 -ResourceGroup $ResourceGroup -SubscriptionId $TargetSubscriptionId"
     Write-Host '  Tear it all down:'
-    Write-Host "    powershell -NoProfile -File scripts/destroy-cloud.ps1 -ResourceGroup $ResourceGroup"
+    Write-Host "    powershell -NoProfile -File scripts/destroy-cloud.ps1 -ResourceGroup $ResourceGroup -SubscriptionId $TargetSubscriptionId"
 
     if ($healthOk -and $jobOk) {
         Write-Host ''
