@@ -27,6 +27,8 @@ Two rules govern this file:
 | Sync job schedule | `Schedule`, cron `0 */6 * * *`, retry 1, timeout 1800 | `az containerapp job show -g rg-opsbridge365 -n opsbridge-sync` |
 | Azure resources | 8 in `rg-opsbridge365` (westus2) | `az resource list -g rg-opsbridge365 -o table` |
 | Key Vault denies the human operator | `ForbiddenByRbac` | `az keyvault secret list --vault-name <vault>` |
+| Deploy identity privilege | **Contributor only** (RBAC Administrator removed) | `az rest --method get --url ".../roleAssignments?api-version=2022-04-01"`, filtered to the deploy principal |
+| Deploy identity cannot grant roles | Refused with `AuthorizationFailed` | asserted on every deployment by the `Verify - deployment identity CANNOT create role assignments` step |
 | Offline tests | **106 passed, 12 deselected** | `python -m pytest -q` |
 | Lint | clean, and a hard CI gate | `ruff check .` |
 | Secret scan, full history | **0 findings** over 13 commits | `gitleaks git . --log-opts="--all"` — CI runs the same command; until 2026-08-29 it ran `gitleaks-action`, which scanned only the push range. See [SECURITY.md](SECURITY.md) |

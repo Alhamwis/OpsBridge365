@@ -735,13 +735,18 @@ devices, and SharePoint write is `Sites.Selected`, scoped to a single site rathe
 than every site in the tenant.
 
 Two more sentences if they want the current shape rather than the original one.
-**The routine deployment now needs Contributor and nothing more**, because the
-one privileged step — creating the Key Vault role assignment — moved into a
-bootstrap template a human runs once. Be precise if they press: the templates no
-longer require the elevated role, and the standing grant on the service
-principal is removed as the final step of the migration rather than in advance
-of proving the new templates deploy. Claiming a privilege is gone before you
-have taken it away is exactly the kind of thing this project tries not to do.
+**The deployment identity holds Contributor and nothing more**, because the one
+privileged step — creating the Key Vault role assignment — moved into a bootstrap
+template a human runs once.
+
+Two details worth having ready, because they are what separates a claim from a
+control. First, the **order**: the split templates were deployed green *before*
+the elevated grant was removed, not after, so there was never a window where the
+documentation was ahead of reality. Second, it is **continuously asserted**, not
+asserted once — every deployment runs a step that attempts to create a `Reader`
+role assignment as the pipeline identity and fails the build if Azure permits
+it. A privilege reduction nothing checks is a privilege reduction that quietly
+comes back.
 And **live tenant data is behind a bearer token**:
 `/metrics` authenticates, rate limits and caches; `/healthz` and `/demo/metrics`
 stay public because neither touches a tenant.

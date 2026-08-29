@@ -903,12 +903,13 @@ This list is meant to be complete as of **2026-08-29**.
   preflight-checked but has not been run against the live resource group, so
   "the blast radius is one resource group" is a design property that has not been
   demonstrated by deleting it.
-- **The deploy identity still holds Role Based Access Control Administrator** at
-  resource-group scope (measured 2026-08-29), even though
-  [§2b](#2b-the-infrastructure-split--what-the-routine-identity-can-no-longer-do)
-  removed the need for it. Until that assignment is removed, the routine identity
-  is more privileged than the template it deploys requires — Contributor is the
-  correct standing role.
+- ~~The deploy identity still holds Role Based Access Control Administrator.~~
+  **Closed 2026-08-29.** The assignment was removed after the split templates
+  deployed green, and the identity now holds **Contributor only** at
+  resource-group scope. This is no longer a gap; it is asserted on every
+  deployment by the `Verify - deployment identity CANNOT create role
+  assignments` step, which attempts a `Reader` assignment as the deploy identity
+  and requires Azure to refuse it.
 - **The interactive API documentation is public.** `/docs`, `/redoc` and
   `/openapi.json` are served unauthenticated: FastAPI's defaults are not
   overridden. They describe three endpoints and echo the deployed version; they

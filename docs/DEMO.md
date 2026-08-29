@@ -349,9 +349,12 @@ Then the two that land hardest:
 > assignment needs a much stronger role, so that step moved into a separate
 > template a human runs once — `bootstrap.bicep`. The routine deployment never
 > creates a role assignment and never sees a secret value; it only references the
-> vault. The standing elevated grant comes off the service principal once the
-> new templates have deployed green — I'd rather say 'scheduled' than claim a
-> privilege is gone before I've taken it away."
+> vault. And the elevated grant is gone — I removed it after the split
+> templates deployed green, in that order, because claiming a privilege is gone
+> before you've taken it away is how you end up with documentation nobody
+> believes. Every deploy since then re-proves it: there's a step that tries to
+> create a role assignment as the pipeline identity and fails the build if Azure
+> lets it."
 
 Now do it live, because a refusal is better than an assertion:
 

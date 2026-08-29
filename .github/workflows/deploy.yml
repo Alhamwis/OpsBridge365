@@ -470,6 +470,78 @@ jobs:
           echo "$body" | jq -e '.synthetic == true' > /dev/null
           echo "- \`GET ${url}\` -> **200**, \`synthetic: true\`" >> "$GITHUB_STEP_SUMMARY"
 
+      # ---------------------------------------------------------------------
+      # Negative test: the deployment identity must NOT be able to grant roles.
+      # ---------------------------------------------------------------------
+      # The privilege reduction is only real if something checks it. This runs
+      # in the one place the deploy identity is actually authenticated, and
+      # asserts a FAILURE rather than a success - which is the only way to test
+      # "cannot" rather than "does not".
+      #
+      # It attempts the most harmless role assignment available: Reader, scoped
+      # to the resource group, for the identity itself. If Azure refuses with
+      # AuthorizationFailed, the reduction holds and the step passes. If it
+      # SUCCEEDS, the identity still carries a role-granting permission - the
+      # step deletes what it just created (so the test leaves nothing behind)
+      # and then fails the run loudly.
+      #
+      # `az role assignment` is deliberately not used: that command group fails
+      # with (MissingSubscription) on some machines even when --subscription is
+      # passed. `az rest` against the ARM endpoint is unambiguous.
+      - name: Verify - deployment identity CANNOT create role assignments
+        env:
+          RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}
+          SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -uo pipefail
+          # Reader - a public, built-in role definition id, identical in every tenant.
+          READER="acdd72a7-3385-48ef-bd42-f606fba81ae7"
+          SCOPE="/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}"
+          NAME=$(cat /proc/sys/kernel/random/uuid)
+          PRINCIPAL=$(az ad signed-in-user show --query id -o tsv 2>/dev/null || true)
+          if [ -z "$PRINCIPAL" ]; then
+            PRINCIPAL=$(az account show --query user.name -o tsv)
+            PRINCIPAL=$(az ad sp show --id "$PRINCIPAL" --query id -o tsv 2>/dev/null || true)
+          fi
+          if [ -z "$PRINCIPAL" ]; then
+            echo "::error::could not resolve the deploy principal's object id"
+            exit 1
+          fi
+
+          echo "Attempting a Reader role assignment as the deploy identity (this MUST fail)"
+          body=$(printf '{"properties":{"roleDefinitionId":"/subscriptions/%s/providers/Microsoft.Authorization/roleDefinitions/%s","principalId":"%s","principalType":"ServicePrincipal"}}' \
+                 "$SUBSCRIPTION_ID" "$READER" "$PRINCIPAL")
+          set +e
+          out=$(az rest --method put \
+                 --url "https://management.azure.com${SCOPE}/providers/Microsoft.Authorization/roleAssignments/${NAME}?api-version=2022-04-01" \
+                 --body "$body" 2>&1)
+          code=$?
+          set -e
+
+          if [ $code -ne 0 ]; then
+            if echo "$out" | grep -qi 'AuthorizationFailed\|does not have permission\|Forbidden'; then
+              echo "Refused, as required."
+              {
+                echo "### Least privilege verified"
+                echo ""
+                echo "- The deployment identity attempted to create a \`Reader\` role assignment and was **refused**."
+                echo "- It holds Contributor, which cannot write \`Microsoft.Authorization/roleAssignments\`."
+                echo "- Role assignments are created only by \`infra/bootstrap.bicep\`, run by a human."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            echo "::error::the attempt failed, but not with an authorization error - investigate"
+            echo "$out" | tail -5
+            exit 1
+          fi
+
+          # It succeeded. Clean up first so the test leaves nothing behind, then fail.
+          echo "::error::The deployment identity CREATED a role assignment. The privilege reduction is not in effect."
+          az rest --method delete \
+            --url "https://management.azure.com${SCOPE}/providers/Microsoft.Authorization/roleAssignments/${NAME}?api-version=2022-04-01" \
+            >/dev/null 2>&1 || echo "::warning::could not remove the assignment this test created: ${NAME}"
+          exit 1
+
       - name: Verify - sync job exists
         env:
           RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}

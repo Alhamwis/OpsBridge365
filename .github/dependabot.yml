@@ -60,6 +60,21 @@ updates:
       day: monday
       time: "06:00"
     open-pull-requests-limit: 3
+    # Digest and patch updates within 3.12 are exactly what is wanted - that is
+    # how the base image picks up OS security fixes without anyone remembering
+    # to look. A Python MINOR or MAJOR bump is not a dependency update, it is a
+    # runtime migration: `requires-python`, ruff's `target-version`, and the
+    # PYTHON_VERSION used by CI all say 3.12, so a base image on 3.14 would ship
+    # an interpreter that nothing in this repository tests against.
+    #
+    # Dependabot proposed exactly that (3.12-slim -> 3.14-slim) on its first
+    # run. Declining it in configuration rather than by closing the PR each
+    # time is the difference between a decision and a chore.
+    ignore:
+      - dependency-name: "python"
+        update-types:
+          - "version-update:semver-major"
+          - "version-update:semver-minor"
     labels:
       - dependencies
       - docker
