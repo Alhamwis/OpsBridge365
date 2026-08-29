@@ -29,7 +29,7 @@ Two rules govern this file:
 | Key Vault denies the human operator | `ForbiddenByRbac` | `az keyvault secret list --vault-name <vault>` |
 | Offline tests | **106 passed, 12 deselected** | `python -m pytest -q` |
 | Lint | clean, and a hard CI gate | `ruff check .` |
-| Secret scan, full history | **0 findings** | `gitleaks git . --log-opts="--all"` |
+| Secret scan, full history | **0 findings** over 13 commits | `gitleaks git . --log-opts="--all"` — CI runs the same command; until 2026-08-29 it ran `gitleaks-action`, which scanned only the push range. See [SECURITY.md](SECURITY.md) |
 | Same scan with the allowlist pointed away | **2 findings, both public Microsoft role GUIDs** | `gitleaks git . --log-opts="--all" -c /tmp/no-allowlist.toml` — see [SECURITY.md](SECURITY.md). Omitting `--config` does *not* disable the allowlist; gitleaks still reads `./.gitleaks.toml` |
 | Bicep templates compile | 0 diagnostics | `az bicep build --file infra/main.bicep` and `.../bootstrap.bicep` |
 
@@ -79,6 +79,17 @@ These were real observations. They are not claims about today.
 Things this deployment established that are not obvious from the code, and that
 cost real time to discover. Kept here because they are the kind of thing that is
 rediscovered expensively.
+
+**The secret scan was scanning one commit, not the history.** `ci.yml` and
+`deploy.yml` checked out with `fetch-depth: 0` and the documentation claimed
+full-history scanning on the strength of it. `gitleaks/gitleaks-action` scans the
+push range instead: the run cited as proof logged `git log -p -U0 -1` and
+`1 commits scanned`. The history was fetched and never read. It only surfaced
+because a force-push left the action diffing from a commit that no longer
+existed, and it failed the job having scanned ~0 bytes. Reading the workflow file
+would never have caught it — the file was not the thing that was wrong. The job
+now runs the gitleaks binary directly with `--log-opts="--all"`, pinned by
+version and verified by checksum, and prints the number of commits it scanned.
 
 **The alert query matched a status the app never emitted on that path.** The
 failure alert was built, looked correct, was syntactically valid and pointed at

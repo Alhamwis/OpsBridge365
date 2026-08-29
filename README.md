@@ -310,7 +310,7 @@ deploying.
 | Container | Multi-stage Dockerfile on `python:3.12-slim` **pinned by digest**, non-root uid 10001 |
 | Supply chain | Every GitHub Action pinned to a commit SHA · CodeQL · Trivy (filesystem + image) · SBOM (SPDX) |
 | Infrastructure | Bicep — `bootstrap.bicep` (once, privileged) + `main.bicep` (routine, Contributor only) |
-| CI/CD | GitHub Actions, OIDC federated login, GHCR, gitleaks over full history |
+| CI/CD | GitHub Actions, OIDC federated login, GHCR, gitleaks over every commit on every ref (`--log-opts="--all"`) |
 | Cloud | Azure Container Apps (Job + App), Key Vault, Log Analytics |
 | Data | Microsoft Graph, SharePoint lists |
 

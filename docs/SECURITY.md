@@ -543,13 +543,42 @@ credential. Seed rows in the provisioning script are visibly fictional —
 
 **The detective control alongside it: gitleaks in CI.** `.gitignore`-first is
 preventive and depends on the ignore list being complete; the scan does not.
-Both `ci.yml` and `deploy.yml` run a `secret-scan` job (`gitleaks/gitleaks-action`,
-pinned to a commit SHA) with three properties that are the whole point:
+Both `ci.yml` and `deploy.yml` run a `secret-scan` job with three properties that
+are the whole point:
 
-- **Full history, not the diff.** `actions/checkout` with `fetch-depth: 0`. A
-  shallow clone only sees the tip, so a credential committed and then deleted a
-  commit later would scan clean — and that is precisely the case where the
-  credential is still live and still published.
+- **Full history, not the diff.** `actions/checkout` with `fetch-depth: 0`, and
+  then `gitleaks git . --log-opts="--all"`, which scans every commit reachable
+  from every ref. A shallow clone only sees the tip, so a credential committed
+  and then deleted a commit later would scan clean — and that is precisely the
+  case where the credential is still live and still published.
+
+  > **This is a correction, and it is worth reading.** Until 2026-08-29 this job
+  > used `gitleaks/gitleaks-action`, and this section claimed full-history
+  > scanning on the strength of `fetch-depth: 0`. The action does not do that.
+  > It scans the **push range**. The run this repository cited as its proof,
+  > `32122134218`, logged exactly this:
+  >
+  > ```
+  > git log -p -U0 -1
+  > 1 commits scanned.
+  > no leaks found
+  > ```
+  >
+  > One commit. The history was fetched and never read. The guarantee was in the
+  > YAML and in the prose, and not in what ran — and no amount of reading the
+  > workflow file would have shown it, because the file was not the thing that
+  > was wrong. It took reading a run log.
+  >
+  > It surfaced when the force-push that rewrote this repository's history left
+  > the action trying to diff from a commit that no longer existed; it failed
+  > the job having scanned ~0 bytes. A crash is how a silent gap usually gets
+  > found.
+  >
+  > The job now invokes the gitleaks binary directly, pinned to a version and
+  > verified by SHA-256 against the checksum published with the release, with an
+  > explicit `--log-opts="--all"`. The claim and the behaviour now match, and
+  > the step prints the commit count it scanned so the next person can check
+  > without trusting this paragraph.
 - **A hard gate.** No `continue-on-error`. In `deploy.yml`, `build-and-push`
   declares `needs: [secret-scan, test, codeql]`, so a finding stops the run before
   an image is pushed to ghcr.io and therefore before anything can reach Azure.
