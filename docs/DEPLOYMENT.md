@@ -230,7 +230,7 @@ not bookkeeping.
 | Job | Deploy infrastructure to Azure | Call Microsoft Graph at runtime |
 | Auth | OIDC federated credential | Client secret |
 | Client secret? | **No. Never. Not one.** | Yes — the only stored password in the system |
-| Azure RBAC | **Contributor, resource group scope only** — that is all `infra/main.bicep` now requires. Measured 2026-08-29 the principal *also* still carries `Role Based Access Control Administrator` from the old design; removing it is the last step of the split, see [Contributor and nothing more](#contributor-and-nothing-more--and-how-to-remove-the-elevated-role) | **None at all.** It never touches ARM |
+| Azure RBAC | **Contributor, resource group scope only.** Nothing else — the `Role Based Access Control Administrator` grant the old design required was removed on 2026-08-29, after the split templates deployed green. Every deployment re-checks it, see [Contributor and nothing more](#contributor-and-nothing-more--and-how-to-remove-the-elevated-role) | **None at all.** It never touches ARM |
 | Graph app permissions | **None** | `User.Read.All`, `Device.Read.All`, `Sites.Selected` |
 | Used by | `azure/login` | The containers, via Key Vault |
 | Repo secrets | `AZURE_CLIENT_ID`, `AZURE_TENANT_ID`, `AZURE_SUBSCRIPTION_ID` | `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID` — **the secret is not one of them** |
