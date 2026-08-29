@@ -1,0 +1,134 @@
+# =============================================================================
+# OpsBridge365 - synthetic health check
+# =============================================================================
+# What this proves, and what it does not
+# --------------------------------------
+# A green `deploy` run proves the service was reachable at the moment it was
+# deployed. It says nothing about the following Tuesday. This workflow is the
+# only thing in the repository that observes the service on an ongoing basis,
+# and its run history is the evidence - a red run is a real outage that was
+# really observed, and it is left red.
+#
+# It is NOT an uptime SLA. Six probes a day cannot measure availability to a
+# percentage, so no percentage is published anywhere from this data.
+#
+# Design constraints, each one deliberate:
+#
+#   * It calls /healthz, never /metrics. /healthz needs no credential, touches
+#     no tenant and makes no Microsoft Graph call, so the monitor cannot become
+#     the amplifier that /metrics was hardened against.
+#   * Every 4 hours, not every 5 minutes. The API runs at minReplicas 0 and the
+#     whole cost argument is that it sleeps. A frequent probe would hold it
+#     awake and quietly convert a $0 service into a billed one - the monitor
+#     would be measuring a system it had itself changed.
+#   * It never redeploys, restarts or "remediates" anything. Automatic recovery
+#     would erase the very signal this exists to capture.
+#   * `contents: read` and nothing else. It needs no secrets: the URL is public
+#     and is committed below rather than hidden in a repository secret, because
+#     hiding a public hostname buys nothing and makes the workflow unreadable.
+# =============================================================================
+
+name: health
+
+on:
+  schedule:
+    # Every 4 hours. Cron here is UTC; GitHub may delay a scheduled run under
+    # load, which is normal and not an outage.
+    - cron: "0 */4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: health
+  cancel-in-progress: false
+
+env:
+  API_BASE: https://opsbridge-api.purplewave-d90933e8.westus2.azurecontainerapps.io
+
+jobs:
+  probe:
+    name: probe /healthz
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: GET /healthz
+        run: |
+          set -uo pipefail
+          url="${API_BASE}/healthz"
+          echo "Probing ${url}"
+
+          # The app scales to zero, so a cold start is expected and is not a
+          # failure. Bounded retry: 6 attempts, 20s apart, 30s per request -
+          # about two minutes total, comfortably longer than a cold start and
+          # far short of "retry until it eventually works".
+          code=000
+          body=""
+          for attempt in $(seq 1 6); do
+            start=$(date +%s%3N)
+            code=$(curl -sS -o /tmp/healthz.json -w '%{http_code}' --max-time 30 "$url" || echo 000)
+            end=$(date +%s%3N)
+            elapsed=$((end - start))
+            body=$(cat /tmp/healthz.json 2>/dev/null || echo "")
+            echo "attempt ${attempt}: HTTP ${code} in ${elapsed}ms"
+            if [ "$code" = "200" ]; then
+              {
+                echo "### Health probe: PASS"
+                echo ""
+                echo "- \`GET ${url}\` -> **200** on attempt ${attempt} (${elapsed} ms)"
+                echo "- Response: \`${body}\`"
+                echo "- Checked at: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+                echo ""
+                echo "_First attempt after idle includes a scale-from-zero cold start._"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            [ "$attempt" -lt 6 ] && sleep 20
+          done
+
+          # Honest failure. No retry loop that hides it, no automatic redeploy.
+          {
+            echo "### Health probe: FAIL"
+            echo ""
+            echo "- \`GET ${url}\` never returned 200 in 6 attempts over ~2 minutes."
+            echo "- Last status: **${code}**"
+            echo "- Checked at: $(date -u '+%Y-%m-%d %H:%M:%SZ')"
+            echo ""
+            echo "This run is left red on purpose. Investigate before redeploying:"
+            echo "\`az containerapp revision list -g rg-opsbridge365 -n opsbridge-api -o table\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::/healthz did not return 200; last status ${code}"
+          exit 1
+
+      - name: GET /demo/metrics
+        # The public demo surface is what a recruiter following the README will
+        # actually open, so a broken demo is a broken portfolio. Checked after
+        # /healthz so a cold start is already paid for.
+        run: |
+          set -uo pipefail
+          url="${API_BASE}/demo/metrics"
+          code=$(curl -sS -o /tmp/demo.json -w '%{http_code}' --max-time 30 "$url" || echo 000)
+          if [ "$code" != "200" ]; then
+            echo "::error::${url} returned ${code}"
+            exit 1
+          fi
+          if ! jq -e '.synthetic == true' /tmp/demo.json > /dev/null; then
+            echo "::error::${url} did not identify itself as synthetic"
+            exit 1
+          fi
+          echo "- \`GET ${url}\` -> **200**, \`synthetic: true\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: GET /metrics without a token
+        # A regression guard, not a health check: if this ever returns 200, the
+        # authentication in front of live tenant data has been removed.
+        run: |
+          set -uo pipefail
+          url="${API_BASE}/metrics"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url" || echo 000)
+          echo "unauthenticated GET /metrics -> ${code}"
+          if [ "$code" = "200" ]; then
+            echo "::error::/metrics served data without a token - live tenant data is public"
+            exit 1
+          fi
+          echo "- \`GET ${url}\` (no token) -> **${code}** (not 200)" >> "$GITHUB_STEP_SUMMARY"
