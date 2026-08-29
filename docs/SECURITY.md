@@ -782,6 +782,24 @@ The scanners, and exactly what each one blocks:
 - **Dependency review** on pull requests, failing on `high`, so a newly
   introduced vulnerable dependency is caught at the diff rather than at the scan.
 
+> **The image gate has already stopped a deployment, on its first real run.**
+> Merge commit `fd16a845` built cleanly, passed the secret scan, the tests and
+> CodeQL, published to ghcr.io — and then `scan image (trivy + sbom)` failed on
+> three HIGH findings and `deploy to Azure` was **skipped**. The finding was
+> `CVE-2026-14456`, an OpenSSL denial of service, present as
+> `3.5.6-1~deb13u2` in the pinned `python:3.12-slim` base.
+>
+> It was genuinely fixable: Debian had already published `3.5.7-1~deb13u2` to
+> `trixie-security`. The base image simply had not been rebuilt, and its digest
+> had not moved — so the pin that makes builds reproducible was also holding a
+> known vulnerability in place. The Dockerfile now applies the distribution's
+> security updates on top of the pinned base, and the trade-off that creates is
+> written down where the layer is.
+>
+> Worth stating plainly, because it is the point of having the gate: nothing
+> here was caught by review. A person reading the Dockerfile would have seen a
+> correctly pinned digest and moved on.
+
 What this does not claim: none of these scanners has yet caught and blocked a
 real vulnerability in this repository. They are configured and the policy above
 is what they would enforce. A clean scan is also a statement about *known* CVEs

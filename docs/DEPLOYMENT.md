@@ -903,8 +903,19 @@ deadline. **That conclusion was false.** The clock is real:
 
 - Capture any live-tenant evidence you still need **before 2026-09-16**.
 - Before that date, decide whether to convert or cancel in the Microsoft 365
-  admin center (*Billing → Your products*). Microsoft exposes no supported Graph
-  or CLI API for it, so it cannot be scripted or alerted on from here.
+  admin center. Microsoft exposes no supported Graph or CLI API for it, so it
+  cannot be scripted or alerted on from here. The exact path, checked against
+  Microsoft's current documentation (last updated 2026-06-24):
+
+  1. Microsoft 365 admin center → **Billing** (Simplified view), or
+     **Billing → Your products** (Dashboard view)
+  2. Select the OpsBridge365 subscription
+  3. **Edit recurring billing** → **Off** → **Save**
+
+  Note the distinction, because picking the wrong control tears the tenant down
+  early: **Edit recurring billing → Off** leaves the subscription active until
+  it expires. **Cancel subscription** ends it immediately. The first is what is
+  wanted here.
 
 If it lapses: `/healthz` and `/demo/metrics` keep working (no tenant dependency);
 `/metrics` returns **502** — an honest upstream failure, never stale numbers
