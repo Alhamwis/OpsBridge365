@@ -2,45 +2,50 @@
 # OpsBridge365 - build, publish, deploy
 # =============================================================================
 # push to main (or manual dispatch)
-#   -> secret-scan gitleaks over the FULL git history; a finding fails the run
-#   -> test        pytest + ruff
-#      (those two run in parallel and BOTH gate everything below)
-#   -> build-push  image to ghcr.io (free public registry, GITHUB_TOKEN only)
-#   -> deploy      az deployment group create against infra/main.bicep,
-#                  authenticated with OIDC federation - no stored password
+#   -> secret-scan   gitleaks over the FULL git history; a finding fails the run
+#   -> test          ruff + pytest, both hard gates
+#   -> codeql        static analysis
+#      (those three run in parallel and ALL gate everything below)
+#   -> build-push    image to ghcr.io (free public registry, GITHUB_TOKEN only)
+#   -> scan-image    Trivy + SBOM against the exact digest just published
+#   -> deploy        az deployment group create against infra/main.bicep,
+#                    authenticated with OIDC federation - no stored password
 #
-# secret-scan gates `build-and-push`, which gates `deploy`, so a leaked
-# credential cannot be baked into a published image or shipped to Azure. It is a
-# hard gate: no `continue-on-error`, and scanning history rather than the diff,
+# Every gate is hard. A leaked credential, a failing test, a lint regression or
+# a fixable CRITICAL/HIGH vulnerability all stop the pipeline before anything is
+# published or shipped. The secret scan reads history rather than the diff,
 # because a secret removed in a later commit is still a live secret.
 #
-# There is no client secret and no `creds:` JSON anywhere in this file. The only
-# credential used against Azure is a short-lived OIDC token minted by GitHub for
-# this repository and exchanged for an access token by the federated app
-# registration. `id-token: write` is what allows that mint; nothing else does.
+# Third-party actions are pinned to full commit SHAs; the trailing comment is
+# the human-readable version. A tag is a movable ref and would let whoever
+# controls the action's repository change what runs in a job that holds
+# `id-token: write`.
 #
 # TWO SEPARATE APP REGISTRATIONS, IN TWO SEPARATE TENANTS. Both halves of that
 # sentence matter, and merging either one back together re-introduces a defect:
 #
 #   opsbridge-deploy  - deploys to Azure. OIDC federated credential, NO SECRET.
-#                       Has ARM rights on one resource group. No Graph perms.
-#                       Lives in the SCHOOL tenant, which owns the subscription.
-#   opsbridge-graph   - runtime Graph caller. HAS a client secret. Graph
-#                       application permissions only, NO Azure RBAC at all.
-#                       Lives in the MICROSOFT 365 tenant, which owns the
-#                       SharePoint data and can grant app-only Graph consent.
+#                       Contributor on one resource group. No Graph perms, and
+#                       NO Role Based Access Control Administrator - see below.
+#                       Lives in the college tenant, which owns the subscription.
+#   opsbridge-graph   - runtime Graph caller. HAS a client secret, which lives
+#                       ONLY in Key Vault. Graph application permissions only,
+#                       NO Azure RBAC at all. Lives in the Microsoft 365 tenant,
+#                       which owns the SharePoint data and can grant app-only
+#                       Graph consent.
 #
-# If the two apps are one app, the long-lived Graph secret also carries ARM
-# rights on the resource group, so leaking it hands over the Azure scope as well
-# as Graph - and the stored credential defeats the point of using OIDC at all.
+# WHY THIS WORKFLOW NO LONGER CARRIES GRAPH_CLIENT_SECRET
+# -------------------------------------------------------
+# It used to pass the Graph client secret to Bicep on every deployment, so the
+# credential sat in GitHub's secret store and was handed over on every push.
+# infra/bootstrap.bicep now places it in Key Vault once, and infra/main.bicep
+# only references it. The routine pipeline never sees the value.
 #
-# If the two TENANT IDS are one value, the deployed container builds its MSAL
-# authority from the wrong directory and every Graph token request fails with
-# "application not found in the directory". The two ids are therefore two
-# distinct repository secrets and are NEVER interchanged. AZURE_TENANT_ID
-# appears exactly once in this file, in the `azure/login` step.
+# The same split removed the deployment identity's standing Role Based Access
+# Control Administrator: the Key Vault role assignment that required it moved
+# into bootstrap.bicep, which a human runs deliberately.
 #
-# ------- identity A: opsbridge-deploy - SCHOOL tenant (OIDC, no secret) ------
+# ------- identity A: opsbridge-deploy - college tenant (OIDC, no secret) -----
 # | Secret                 | What it is                                       |
 # |------------------------|--------------------------------------------------|
 # | AZURE_CLIENT_ID        | App (client) id of the DEPLOY app registration.  |
@@ -53,7 +58,7 @@
 # |                        | identifier, not a credential.                    |
 # | AZURE_SUBSCRIPTION_ID  | Subscription the resource group lives in.        |
 #
-# ------- identity B: opsbridge-graph - M365 tenant (secret, no ARM) ----------
+# ------- identity B: opsbridge-graph - M365 tenant (secret lives in KV) ------
 # | Secret                 | What it is                                       |
 # |------------------------|--------------------------------------------------|
 # | GRAPH_TENANT_ID        | Directory (tenant) id of the Microsoft 365       |
@@ -64,28 +69,19 @@
 # | GRAPH_CLIENT_ID        | App (client) id of the GRAPH app registration.   |
 # |                        | Passed to Bicep as `clientId`. Never used to     |
 # |                        | authenticate this workflow to Azure.             |
-# | GRAPH_CLIENT_SECRET    | Client secret of the GRAPH app - the only stored |
-# |                        | password in the system. Passed to Bicep, which   |
-# |                        | puts it in Key Vault for the *containers* to     |
-# |                        | read. This app holds no Azure RBAC role, so the  |
-# |                        | secret grants Graph access and nothing more.     |
 #
 # ---------------- data locations (identifiers, not credentials) --------------
-# | Secret                 | What it is                                       |
-# |------------------------|--------------------------------------------------|
 # | SHAREPOINT_SITE_ID     | Graph id of the SharePoint site.                 |
 # | ASSETS_LIST_ID         | Graph id of the Assets list (written by sync).   |
 # | TICKETS_LIST_ID        | Graph id of the Tickets list (read by /metrics). |
 #
 # -------------------------------- optional repository variables --------------
-# | Variable               | Default              | Meaning                    |
-# |------------------------|----------------------|----------------------------|
 # | AZURE_RESOURCE_GROUP   | rg-opsbridge365      | Target resource group      |
-# | AZURE_LOCATION         | eastus               | Region if the RG is new    |
+# | AZURE_LOCATION         | westus2              | Region if the RG is new    |
 # | NAME_PREFIX            | opsbridge            | Bicep namePrefix param     |
 #
-# Full setup (including the federated-credential subject) is in
-# docs/DEPLOYMENT.md.
+# Full setup (including the federated-credential subject and the one-time
+# bootstrap) is in docs/DEPLOYMENT.md.
 # =============================================================================
 
 name: deploy
@@ -122,13 +118,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # The whole history, not a shallow clone - see the note at the top.
           fetch-depth: 0
 
       - name: gitleaks
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
@@ -141,35 +137,57 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Python ${{ env.PYTHON_VERSION }}
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
-          cache-dependency-path: pyproject.toml
+          cache-dependency-path: requirements-dev.txt
 
-      - name: Install project (dev extras)
+      - name: Install pinned dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install ".[dev]"
+          pip install --require-hashes --no-deps -r requirements-dev.txt
+          pip install --no-deps -e .
 
       - name: Lint (ruff)
-        # Advisory: style regressions report but do not block a deploy. The
-        # tests below are the gate.
-        continue-on-error: true
+        # A hard gate. A lint failure stops the image being published and stops
+        # the deployment; it used to be `continue-on-error: true`.
         run: ruff check .
 
       - name: Tests (pytest)
         run: python -m pytest -q
 
+  # -------------------------------------------------------- static analysis --
+  codeql:
+    name: CodeQL (python)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Initialise CodeQL
+        uses: github/codeql-action/init@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
+        with:
+          languages: python
+          queries: security-extended
+
+      - name: Analyse
+        uses: github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d # v3.37.9
+        with:
+          category: "/language:python"
+
   # -------------------------------------------------------- build and push --
   build-and-push:
     name: build and push to ghcr.io
-    # Both gates, not just the tests. Nothing is published to ghcr.io - and so
-    # nothing can be deployed to Azure - unless the secret scan is clean.
-    needs: [secret-scan, test]
+    # All three gates. Nothing is published to ghcr.io - and so nothing can be
+    # deployed to Azure - unless the secret scan, the tests and CodeQL are clean.
+    needs: [secret-scan, test, codeql]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -177,9 +195,10 @@ jobs:
     outputs:
       image: ${{ steps.ref.outputs.image }}
       image-latest: ${{ steps.ref.outputs.image-latest }}
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Compute image reference
         id: ref
@@ -192,24 +211,27 @@ jobs:
           echo "image-latest=${name}:latest"        >> "$GITHUB_OUTPUT"
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to ghcr.io
         # The built-in GITHUB_TOKEN - no PAT to create, rotate or leak. And no
         # Azure Container Registry: a public GHCR package is free and Container
         # Apps pulls it with no registry credentials at all.
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           file: ./Dockerfile
           push: true
+          provenance: mode=max
+          sbom: true
           tags: |
             ${{ steps.ref.outputs.image-latest }}
             ${{ steps.ref.outputs.image }}
@@ -226,12 +248,49 @@ jobs:
             echo ""
             echo '- `${{ steps.ref.outputs.image-latest }}`'
             echo '- `${{ steps.ref.outputs.image }}`'
+            echo '- digest `${{ steps.build.outputs.digest }}`'
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------- scan image --
+  scan-image:
+    name: scan image (trivy + sbom)
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Trivy image scan
+        # Policy: a CRITICAL or HIGH with a fix available fails the run and the
+        # image is never deployed. Unfixable findings are reported and do not
+        # block - failing on them only produces ignore files.
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ needs.build-and-push.outputs.image }}
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: Generate SBOM (SPDX)
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
+        with:
+          image: ${{ needs.build-and-push.outputs.image }}
+          format: spdx-json
+          artifact-name: opsbridge365-sbom.spdx.json
+          output-file: opsbridge365-sbom.spdx.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom-${{ github.sha }}
+          path: opsbridge365-sbom.spdx.json
+          retention-days: 90
 
   # ---------------------------------------------------------------- deploy --
   deploy:
     name: deploy to Azure
-    needs: build-and-push
+    needs: [build-and-push, scan-image]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment: production
@@ -240,7 +299,7 @@ jobs:
       id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Azure login (OIDC, passwordless)
         # AZURE_CLIENT_ID and AZURE_TENANT_ID are the *deploy* identity and its
@@ -248,7 +307,7 @@ jobs:
         # only step in the file that uses either. The Graph runtime identity is
         # a different app registration in a different tenant; see
         # GRAPH_TENANT_ID / GRAPH_CLIENT_ID in the deploy step below.
-        uses: azure/login@v2
+        uses: Azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
@@ -257,7 +316,7 @@ jobs:
       - name: Ensure resource group
         env:
           RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}
-          LOCATION: ${{ vars.AZURE_LOCATION || 'eastus' }}
+          LOCATION: ${{ vars.AZURE_LOCATION || 'westus2' }}
         run: |
           set -euo pipefail
           az group create \
@@ -272,13 +331,10 @@ jobs:
           RESOURCE_GROUP: ${{ vars.AZURE_RESOURCE_GROUP || 'rg-opsbridge365' }}
           NAME_PREFIX: ${{ vars.NAME_PREFIX || 'opsbridge' }}
           CONTAINER_IMAGE: ${{ needs.build-and-push.outputs.image }}
-          # Secrets reach the CLI through the environment only - never inlined
-          # into the command line, never echoed. No `set -x` in this step.
-          #
-          # These are the GRAPH runtime identity, not the deploy identity. The
-          # deploy identity (AZURE_CLIENT_ID / AZURE_TENANT_ID) is deliberately
-          # absent from this step: it has no Graph permissions and must never
-          # end up in Key Vault or in a container's environment.
+          # These are the GRAPH runtime identity's public identifiers, not the
+          # deploy identity, and not a credential: the client SECRET is not
+          # here any more - bootstrap.bicep put it in Key Vault and main.bicep
+          # only references it.
           #
           # GRAPH_TENANT_ID, not AZURE_TENANT_ID. The container turns this into
           # its MSAL authority (https://login.microsoftonline.com/<id>), so it
@@ -286,7 +342,6 @@ jobs:
           # registered - not the tenant that owns the Azure subscription.
           GRAPH_TENANT_ID: ${{ secrets.GRAPH_TENANT_ID }}
           GRAPH_CLIENT_ID: ${{ secrets.GRAPH_CLIENT_ID }}
-          GRAPH_CLIENT_SECRET: ${{ secrets.GRAPH_CLIENT_SECRET }}
           SHAREPOINT_SITE_ID: ${{ secrets.SHAREPOINT_SITE_ID }}
           ASSETS_LIST_ID: ${{ secrets.ASSETS_LIST_ID }}
           TICKETS_LIST_ID: ${{ secrets.TICKETS_LIST_ID }}
@@ -301,7 +356,6 @@ jobs:
               containerImage="$CONTAINER_IMAGE" \
               graphTenantId="$GRAPH_TENANT_ID" \
               clientId="$GRAPH_CLIENT_ID" \
-              clientSecret="$GRAPH_CLIENT_SECRET" \
               sharePointSiteId="$SHAREPOINT_SITE_ID" \
               assetsListId="$ASSETS_LIST_ID" \
               ticketsListId="$TICKETS_LIST_ID" \
@@ -339,6 +393,33 @@ jobs:
           done
           echo "::error::/healthz never returned 200 - failing the deploy"
           exit 1
+
+      - name: Verify - /metrics refuses an unauthenticated caller
+        env:
+          FQDN: ${{ steps.infra.outputs.api-fqdn }}
+        run: |
+          set -euo pipefail
+          url="https://${FQDN}/metrics"
+          code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 "$url" || echo 000)
+          echo "unauthenticated GET /metrics -> ${code}"
+          # 401 is the pass. 503 would mean the token secret is missing from
+          # Key Vault, which is also a refusal - but an unconfigured one, and
+          # the operator needs to know. 200 is the regression this checks for.
+          if [ "$code" != "401" ]; then
+            echo "::error::/metrics returned ${code}; expected 401. A 200 means live tenant data is public again."
+            exit 1
+          fi
+          echo "- \`GET ${url}\` (no token) -> **401**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify - public demo endpoint serves synthetic data
+        env:
+          FQDN: ${{ steps.infra.outputs.api-fqdn }}
+        run: |
+          set -euo pipefail
+          url="https://${FQDN}/demo/metrics"
+          body=$(curl -sS --max-time 30 "$url")
+          echo "$body" | jq -e '.synthetic == true' > /dev/null
+          echo "- \`GET ${url}\` -> **200**, \`synthetic: true\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Verify - sync job exists
         env:
