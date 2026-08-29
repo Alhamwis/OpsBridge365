@@ -1,14 +1,28 @@
 // =============================================================================
-// OpsBridge365 - cloud layer, free-tier v2
+// OpsBridge365 - cloud layer, free-tier v2 (ROUTINE deployment)
 // =============================================================================
-// Deploys the whole cloud half of the system into ONE resource group:
+// Deploys the part of the system that changes on every push:
 //
 //   Log Analytics  <- logs for everything below (5 GB/month free)
 //   Container Apps Environment
-//   Key Vault (RBAC)        <- holds the Entra app's client secret, nothing else
-//   User-assigned identity  <- the only thing allowed to read that secret
 //   JOB  opsbridge-sync     <- cron, run-and-exit, `python -m app.sync`
 //   APP  opsbridge-api      <- HTTPS ingress, scale-to-zero (minReplicas 0)
+//
+// It does NOT create the Key Vault, the managed identity, the role assignment,
+// or any secret value. Those are infra/bootstrap.bicep, run once by a human.
+// This template only *references* them, and that split is deliberate:
+//
+//   * A role assignment needs Role Based Access Control Administrator. Leaving
+//     one here meant the GitHub deployment identity carried that privilege on
+//     every push forever, to create an assignment that is created once. The
+//     routine identity now needs Contributor and nothing more.
+//   * Taking the Graph client secret as a parameter meant GitHub had to store
+//     it and hand it over on every deployment. The value now lives only in Key
+//     Vault; this template names the secret and never sees it.
+//
+// Consequence, stated plainly: bootstrap.bicep is a PREREQUISITE. Deploying
+// this template into a resource group that has not been bootstrapped fails at
+// the `existing` lookups below, which is the intended, loud failure.
 //
 // Cost design: the job only bills while it is running and the API only bills
 // while it is awake, so an idle month stays inside the Container Apps free
@@ -34,7 +48,7 @@ targetScope = 'resourceGroup'
 @description('Azure region for every resource. Defaults to the resource group\'s region.')
 param location string = resourceGroup().location
 
-@description('Prefix for all resource names. Keep it short - the Key Vault name is derived from it and vault names are capped at 24 characters.')
+@description('Prefix for all resource names. MUST match the namePrefix used by infra/bootstrap.bicep - the Key Vault name is derived from it.')
 @minLength(3)
 @maxLength(11)
 param namePrefix string = 'opsbridge'
@@ -47,10 +61,6 @@ param graphTenantId string
 
 @description('Application (client) id of the Graph app registration in the Microsoft 365 tenant above. Not a secret.')
 param clientId string
-
-@description('Client secret for the Entra app registration. Stored in Key Vault and read at runtime through the managed identity - it is never inlined into a container definition and never returned as an output.')
-@secure()
-param clientSecret string
 
 @description('Graph id of the SharePoint site holding the Assets and Tickets lists.')
 param sharePointSiteId string
@@ -70,17 +80,17 @@ param syncCron string = '0 */6 * * *'
 // a hung Graph call can never bill for longer than 30 minutes.
 var replicaTimeoutSeconds = 1800
 
-// Built-in role: Key Vault Secrets User (read secret values, data plane).
-var keyVaultSecretsUserRoleId = '4633458b-17de-408a-b874-0445c86b69e6'
+var graphSecretName = 'graph-client-secret'
+var metricsTokenSecretName = 'metrics-api-token'
 
-var secretName = 'graph-client-secret'
-
-// Vault names are globally unique and max 24 chars, hence the hash + take().
+// Derived identically to infra/bootstrap.bicep. If the two ever disagree, this
+// template fails on the `existing` lookup rather than silently building a
+// second vault - which is the failure mode worth having.
 var keyVaultName = take('${namePrefix}kv${uniqueString(resourceGroup().id)}', 24)
+var identityName = '${namePrefix}-id'
 
 var logAnalyticsName = '${namePrefix}-logs'
 var environmentName = '${namePrefix}-env'
-var identityName = '${namePrefix}-id'
 var jobName = '${namePrefix}-sync'
 var apiName = '${namePrefix}-api'
 
@@ -90,9 +100,25 @@ var commonTags = {
   managedBy: 'bicep'
 }
 
+// ------------------------------------------------- bootstrapped references --
+
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: keyVaultName
+}
+
+resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' existing = {
+  name: identityName
+}
+
+// Versionless secret URIs. A version-pinned URI would mean every secret
+// rotation needs a redeployment; versionless lets Container Apps pick up a new
+// version on the next revision restart.
+var graphSecretUri = '${keyVault.properties.vaultUri}secrets/${graphSecretName}'
+var metricsSecretUri = '${keyVault.properties.vaultUri}secrets/${metricsTokenSecretName}'
+
 // Configuration that is NOT sensitive: ids, not credentials. These are plain
 // env vars on purpose - putting public identifiers in Key Vault would add cost
-// and noise without adding protection. Only the client secret is a secret.
+// and noise without adding protection. Only the two secrets are secret.
 var configEnv = [
   {
     // Named AZURE_TENANT_ID because that is what app/config.py reads, but the
@@ -118,11 +144,35 @@ var configEnv = [
   }
 ]
 
-// The one credential, pulled from Key Vault at container start via secretRef.
-var secretEnv = [
+var graphSecretEnv = [
   {
     name: 'AZURE_CLIENT_SECRET'
-    secretRef: secretName
+    secretRef: graphSecretName
+  }
+]
+
+// Only the API needs this. The sync job has no HTTP surface, so giving it the
+// metrics token would hand a credential to a workload that cannot use it.
+var metricsTokenEnv = [
+  {
+    name: 'METRICS_API_TOKEN'
+    secretRef: metricsTokenSecretName
+  }
+]
+
+var graphSecretRef = [
+  {
+    name: graphSecretName
+    keyVaultUrl: graphSecretUri
+    identity: identity.id
+  }
+]
+
+var metricsSecretRef = [
+  {
+    name: metricsTokenSecretName
+    keyVaultUrl: metricsSecretUri
+    identity: identity.id
   }
 ]
 
@@ -142,70 +192,6 @@ resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2023-09-01' = {
     }
     publicNetworkAccessForIngestion: 'Enabled'
     publicNetworkAccessForQuery: 'Enabled'
-  }
-}
-
-// ---------------------------------------------------------------- identity --
-
-// One user-assigned identity shared by the job and the app. Shared on purpose:
-// both need exactly one permission (read one secret), so two identities would
-// be two things to grant, rotate and explain.
-resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
-  name: identityName
-  location: location
-  tags: commonTags
-}
-
-// --------------------------------------------------------------- key vault --
-
-resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
-  name: keyVaultName
-  location: location
-  tags: commonTags
-  properties: {
-    // The vault's own control-plane tenant - the AZURE tenant that owns this
-    // subscription, deliberately NOT graphTenantId. A vault can only trust
-    // principals from its own directory, and the managed identity below is
-    // created here.
-    tenantId: subscription().tenantId
-    sku: {
-      family: 'A'
-      name: 'standard'
-    }
-    // RBAC instead of access policies: one role assignment below is the entire
-    // authorisation story, and it shows up in `az role assignment list`.
-    enableRbacAuthorization: true
-    enableSoftDelete: true
-    softDeleteRetentionInDays: 7
-    enabledForDeployment: false
-    enabledForTemplateDeployment: false
-    enabledForDiskEncryption: false
-    publicNetworkAccess: 'Enabled'
-    networkAcls: {
-      bypass: 'AzureServices'
-      defaultAction: 'Allow'
-    }
-  }
-}
-
-resource graphClientSecret 'Microsoft.KeyVault/vaults/secrets@2023-07-01' = {
-  parent: keyVault
-  name: secretName
-  properties: {
-    value: clientSecret
-    contentType: 'Entra app registration client secret'
-  }
-}
-
-// Key Vault Secrets User, scoped to this vault only - not the resource group,
-// not the subscription. The identity can read secret values and nothing else.
-resource secretsUserAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  scope: keyVault
-  name: guid(keyVault.id, identity.id, keyVaultSecretsUserRoleId)
-  properties: {
-    roleDefinitionId: subscriptionResourceId('Microsoft.Authorization/roleDefinitions', keyVaultSecretsUserRoleId)
-    principalId: identity.properties.principalId
-    principalType: 'ServicePrincipal'
   }
 }
 
@@ -256,13 +242,7 @@ resource syncJob 'Microsoft.App/jobs@2024-03-01' = {
         parallelism: 1
         replicaCompletionCount: 1
       }
-      secrets: [
-        {
-          name: secretName
-          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${secretName}'
-          identity: identity.id
-        }
-      ]
+      secrets: graphSecretRef
     }
     template: {
       containers: [
@@ -281,17 +261,11 @@ resource syncJob 'Microsoft.App/jobs@2024-03-01' = {
             cpu: json('0.25')
             memory: '0.5Gi'
           }
-          env: concat(configEnv, secretEnv)
+          env: concat(configEnv, graphSecretEnv)
         }
       ]
     }
   }
-  dependsOn: [
-    // The Key Vault reference is resolved when the job is created, so the role
-    // assignment and the secret must both exist first.
-    secretsUserAssignment
-    graphClientSecret
-  ]
 }
 
 // ---------------------------------------------------------------- api app --
@@ -322,13 +296,7 @@ resource apiApp 'Microsoft.App/containerApps@2024-03-01' = {
           }
         ]
       }
-      secrets: [
-        {
-          name: secretName
-          keyVaultUrl: '${keyVault.properties.vaultUri}secrets/${secretName}'
-          identity: identity.id
-        }
-      ]
+      secrets: concat(graphSecretRef, metricsSecretRef)
     }
     template: {
       containers: [
@@ -340,13 +308,12 @@ resource apiApp 'Microsoft.App/containerApps@2024-03-01' = {
             cpu: json('0.25')
             memory: '0.5Gi'
           }
-          env: concat(configEnv, secretEnv)
+          env: concat(configEnv, graphSecretEnv, metricsTokenEnv)
         }
       ]
       scale: {
         // Scale-to-zero. This single line is what makes an idle month cost
-        // nothing; the first request after idle pays a few seconds of cold
-        // start instead.
+        // nothing; the first request after idle pays a cold start instead.
         minReplicas: 0
         maxReplicas: 1
         rules: [
@@ -362,10 +329,6 @@ resource apiApp 'Microsoft.App/containerApps@2024-03-01' = {
       }
     }
   }
-  dependsOn: [
-    secretsUserAssignment
-    graphClientSecret
-  ]
 }
 
 // ----------------------------------------------------------------- outputs --
@@ -375,7 +338,7 @@ resource apiApp 'Microsoft.App/containerApps@2024-03-01' = {
 @description('Public HTTPS hostname of the metrics API.')
 output apiFqdn string = apiApp.properties.configuration.ingress.fqdn
 
-@description('Name of the Key Vault holding the Graph client secret.')
+@description('Name of the Key Vault holding the runtime secrets (created by bootstrap.bicep).')
 output keyVaultName string = keyVault.name
 
 @description('Resource id of the Log Analytics workspace collecting container logs.')

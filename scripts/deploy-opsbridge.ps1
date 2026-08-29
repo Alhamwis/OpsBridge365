@@ -15,10 +15,14 @@
     submitted with az's own --what-if so Azure reports the change set without
     applying it.
 
-    No secret is written to a file, echoed, or logged by this script. The Graph
-    client secret is read from $env:GRAPH_CLIENT_SECRET and handed to the Azure
-    CLI, which passes it to a @secure() Bicep parameter that ARM stores in Key
-    Vault. It is never printed.
+    This script handles NO secret at all. It used to read the Graph client
+    secret from $env:GRAPH_CLIENT_SECRET and pass it to a @secure() Bicep
+    parameter; infra/main.bicep no longer declares that parameter. The secret
+    value is written to Key Vault once by infra/bootstrap.bicep, and the routine
+    deployment only references the vault.
+
+    So there is nothing here to leak: no secret is read, written to a file,
+    echoed, logged, or placed on a command line.
 
 .PARAMETER ResourceGroup
     Target resource group. Defaults to $env:AZURE_RESOURCE_GROUP, then
@@ -56,7 +60,6 @@
     Preview only. Nothing is created, updated, or deleted.
 
 .EXAMPLE
-    $env:GRAPH_CLIENT_SECRET = '<secret>'
     powershell -NoProfile -File scripts/deploy-opsbridge.ps1 -WhatIf
 
 .EXAMPLE
@@ -76,9 +79,14 @@
       SHAREPOINT_SITE_ID    Graph id of the SharePoint site
       ASSETS_LIST_ID        Graph id of the Assets list
       TICKETS_LIST_ID       Graph id of the Tickets list
-      GRAPH_CLIENT_SECRET   the one real secret; never stored by this script
 
-    This script makes no role assignments. If you add one, use `az rest` against
+    GRAPH_CLIENT_SECRET is NOT in that list, and that is the point: the routine
+    deployment never sees it. Set it only when running infra/bootstrap.bicep,
+    which is a separate, deliberate act - see docs/DEPLOYMENT.md.
+
+    This script makes no role assignments, and no longer needs the permission to
+    make one: that moved to infra/bootstrap.bicep. If you add one anyway, use
+    `az rest` against
     .../providers/Microsoft.Authorization/roleAssignments/{guid}?api-version=2022-04-01
     rather than `az role assignment`: that command group fails with
     (MissingSubscription) on some machines even when --subscription is passed
@@ -396,8 +404,12 @@ try {
         @{ Name = 'GRAPH_CLIENT_ID'; Value = $env:GRAPH_CLIENT_ID; Secret = $false },
         @{ Name = 'SHAREPOINT_SITE_ID'; Value = $env:SHAREPOINT_SITE_ID; Secret = $false },
         @{ Name = 'ASSETS_LIST_ID'; Value = $env:ASSETS_LIST_ID; Secret = $false },
-        @{ Name = 'TICKETS_LIST_ID'; Value = $env:TICKETS_LIST_ID; Secret = $false },
-        @{ Name = 'GRAPH_CLIENT_SECRET'; Value = $env:GRAPH_CLIENT_SECRET; Secret = $true }
+        @{ Name = 'TICKETS_LIST_ID'; Value = $env:TICKETS_LIST_ID; Secret = $false }
+        # GRAPH_CLIENT_SECRET is deliberately NOT required any more. The routine
+        # deployment does not carry the secret at all: infra/bootstrap.bicep
+        # writes it to Key Vault once, and main.bicep only references it. If you
+        # are setting up a new environment, or rotating, run bootstrap.bicep -
+        # see docs/DEPLOYMENT.md.
     )
     $missing = @()
     foreach ($entry in $required) {
@@ -409,8 +421,11 @@ try {
         Stop-WithReason -Message ("missing environment variable(s): " + ($missing -join ', ')) -Remedy @(
             'Set them in this shell, for example:',
             '  $env:GRAPH_TENANT_ID = "<microsoft-365-tenant-guid>"',
-            '  $env:GRAPH_CLIENT_SECRET = "<secret>"',
-            'Never commit these. The repo is public and .env is gitignored.',
+            '  $env:GRAPH_CLIENT_ID  = "<graph-app-client-id>"',
+            'None of these is a secret - they are identifiers. The Graph client',
+            'secret is not needed here at all; it lives in Key Vault, placed',
+            'there once by infra/bootstrap.bicep.',
+            'Never commit these anyway. The repo is public and .env is gitignored.',
             'The list ids come from: python scripts/provision_sharepoint.py')
     }
     foreach ($entry in $required) {
@@ -475,7 +490,10 @@ try {
         "containerImage=$ContainerImage",
         "graphTenantId=$($env:GRAPH_TENANT_ID)",
         "clientId=$($env:GRAPH_CLIENT_ID)",
-        "clientSecret=$($env:GRAPH_CLIENT_SECRET)",
+        # No clientSecret. main.bicep no longer declares that parameter - the
+        # secret VALUE is written once by infra/bootstrap.bicep and main.bicep
+        # only references the Key Vault secret. Passing it here would fail with
+        # "the following parameters were supplied but not declared".
         "sharePointSiteId=$($env:SHAREPOINT_SITE_ID)",
         "assetsListId=$($env:ASSETS_LIST_ID)",
         "ticketsListId=$($env:TICKETS_LIST_ID)",
