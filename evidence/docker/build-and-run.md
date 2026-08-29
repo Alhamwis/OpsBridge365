@@ -1,8 +1,17 @@
 # Evidence — Docker build and local run
 
+> **HISTORICAL EVIDENCE — captured 2026-08-16.** Every transcript below is
+> verbatim terminal output from that day and has not been re-run. It is a record
+> of one build, not a description of the current image. The Dockerfile and the
+> application have both moved on since — the differences are listed under
+> [What has changed since this capture](#what-has-changed-since-this-capture).
+> For current state, see [`../../docs/STATUS.md`](../../docs/STATUS.md).
+
 **Date:** 2026-08-16 (container clock showed `Mon, 17 Aug 2026 00:46:53 GMT`, UTC)
 **Host:** Windows 11 Pro 26200, Docker version 29.1.3 (build f52814d), Git Bash
-**Repo:** `D:\OpsBridge365`, branch `master`
+**Branch:** `main`. (The original note recorded `master`; the repository's branch
+is `main` — it is what local and remote HEAD point at, and what
+`.github/workflows/deploy.yml` triggers on.)
 **Image:** `opsbridge365:local`
 
 Everything below is copied from the terminal. Nothing is reconstructed from memory.
@@ -47,6 +56,9 @@ $ python -m pytest -q
 .........................................................                [100%]
 57 passed in 1.69s
 ```
+
+57 was the whole suite on 2026-08-16, before the integration marker split it. It
+is **106 offline plus 12 deselected integration tests** as of 2026-08-29.
 
 ---
 
@@ -105,6 +117,13 @@ Stage layout, from a second (cached) run with `--progress=plain`:
 #9  [runtime 4/5] WORKDIR /srv
 #17 [runtime 5/5] COPY --chown=root:root app ./app
 ```
+
+Two things in that listing are no longer how the image is built. The
+`python:3.12-slim@sha256:2c941e86...` digest is Docker *resolving* a mutable tag
+at build time, not a pin — the Dockerfile said `FROM python:3.12-slim`, so the
+same file would have produced a different base a week later. And `RUN pip install .`
+resolved dependencies live from the `>=` floors in `pyproject.toml`. Both are
+fixed now; see [What has changed since this capture](#what-has-changed-since-this-capture).
 
 ### `.dockerignore` effectiveness
 
@@ -184,6 +203,11 @@ $ curl -s -o /tmp/m.json -w 'HTTP %{http_code}\n' http://127.0.0.1:8099/metrics
 HTTP 503
 {"detail":"Service configuration is incomplete."}
 ```
+
+That 503 is still the behaviour of an unconfigured container, and the endpoint has
+since grown a second reason to return it: with `METRICS_API_TOKEN` unset,
+`/metrics` fails **closed** with 503 rather than falling back to serving data. A
+configured deployment answers 401 to a caller with no bearer token.
 
 Docker's own `HEALTHCHECK` (stdlib `urllib`, no `curl` in the image) reports healthy:
 
@@ -269,6 +293,9 @@ No `.env`, no tests, no docs, no `.git`, no evidence. No `ARG` or `ENV` in the
 Dockerfile carries a credential — the only `ENV` values are `PYTHONDONTWRITEBYTECODE`,
 `PYTHONUNBUFFERED`, `PATH`, and pip's build-time behaviour flags.
 
+The `/srv/app` listing is the package as it stood on 2026-08-16. It has since
+gained `cache.py`, `ratelimit.py`, `security.py` and `demo.py`.
+
 ---
 
 ## 6. Teardown
@@ -285,7 +312,25 @@ is the only image left.
 
 ---
 
-## Checklist
+## What has changed since this capture
+
+Listed so nobody reads the transcripts above as a description of today's image.
+None of these has been re-captured to a file; the Dockerfile is the record.
+
+| Then — 2026-08-16 | Now |
+| --- | --- |
+| `FROM python:3.12-slim` — a mutable tag, resolved to whatever digest Docker had that day | Pinned by digest: `python:3.12-slim@sha256:09f7da3bc104798d0afb40bc08d23ab2da20a76130cec1f2ef170848f5d85217`, with the version kept as a comment |
+| `RUN pip install .` — resolved live from the `>=` floors in `pyproject.toml` | Installs from a fully resolved, hash-pinned lock with `pip install --require-hashes --no-deps -r requirements.txt` |
+| Suite of 57 tests | 106 offline tests, 12 integration deselected |
+| `app/` had eight modules | Plus `cache.py`, `ratelimit.py`, `security.py`, `demo.py` |
+| `/metrics` public once configured | Bearer token required; 401 without one, 503 if no token is configured. `/demo/metrics` is the public, synthetic endpoint |
+
+What did **not** change: multi-stage build, non-root uid 10001, no dev tooling in
+the runtime layer, and the `HEALTHCHECK` on `/healthz` via stdlib `urllib`.
+
+---
+
+## Checklist — as verified on 2026-08-16
 
 | Requirement | Status |
 | --- | --- |

@@ -1,6 +1,11 @@
 # SharePoint reconciliation evidence — the end-to-end proof
 
-This is the headline result: a Container Apps Job running in Azure, reading
+> **HISTORICAL EVIDENCE — captured 2026-08-18.** One execution of the cloud sync
+> job, and what it wrote. The list has not been re-read since, so this is a record
+> of a run rather than a statement about what the Assets list contains today. For
+> current state, see [`../../docs/STATUS.md`](../../docs/STATUS.md).
+
+This was the headline result: a Container Apps Job running in Azure, reading
 Microsoft Graph, and writing a live SharePoint list — with both the confident
 path and the honest-gap path proven by the same run.
 
@@ -26,28 +31,30 @@ users_fetched: 1, devices_fetched: 1, assets_fetched: 4, matched: 1, patched: 1,
 unknown_last_check_in: 1
 ```
 
-## 3. The result in the live SharePoint Assets list
+## 3. What the run wrote to the live SharePoint Assets list
 
 | Asset | AssignedUser | ComplianceStatus |
 | --- | --- | --- |
-| `CONTOSO-LT-001` | SAIF EDDINE AL HAMWI | Compliant |
+| `CONTOSO-LT-001` | Dana Whitfield | Compliant |
 | `CONTOSO-LT-002` | Unknown | Unknown |
 | `CONTOSO-DT-003` | Unknown | Unknown |
 | `CONTOSO-TB-004` | Unknown | Unknown |
 
-**One confident match written, three honest Unknowns.** Both paths are proven by
+**One confident match written, three honest Unknowns.** Both paths were proven by
 one execution, against real data, in the cloud.
 
-The display name is the author's own account in the author's own tenant. The
-device names are the fictional seed rows created by
-`scripts/provision_sharepoint.py` (`CONTOSO-*`), which is why they are safe to
-print.
+The device names are the fictional seed rows created by
+`scripts/provision_sharepoint.py` (`CONTOSO-*`). The `AssignedUser` value in the
+first row is a synthetic stand-in of the same shape: the run wrote the real
+directory display name of the device's registered owner, and a real person's name
+is not reproduced in a public repository. Everything else in the table is the
+observed output.
 
 ## 4. Reading the numbers
 
 | Field | Value | What it means |
 | --- | --- | --- |
-| `users_fetched` | 1 | The tenant has one user — the registered owner |
+| `users_fetched` | 1 | The tenant had one user — the registered owner |
 | `devices_fetched` | 1 | The one synthetic device |
 | `assets_fetched` | 4 | All four seeded Assets rows were read |
 | `matched` | 1 | Exactly one device resolved to exactly one row |
@@ -65,7 +72,7 @@ entirely.
 The three unmatched rows were not touched, not blanked, and not guessed at. A
 device that matches nothing changes nothing.
 
-## 5. What this proves that the offline tests could not
+## 5. What this proved that the offline tests could not
 
 The matching rules — serial number first, then device name; an ambiguous key
 matches nothing — were already covered by offline tests against mocks, and the
@@ -79,3 +86,11 @@ result in a list a human can open.**
 Every link in that chain is a different failure mode, and this run exercised all
 of them at once. The row that changed and the three rows that did not are the
 same evidence.
+
+## 6. What would make this un-reproducible
+
+The tenant hosting the site and both lists is an `O365_BUSINESS_PREMIUM`
+**trial**, `isTrial: true`, `nextLifecycleDateTime` **2026-09-16** (measured
+2026-08-29). If it lapses, the site and the lists go with it and this run cannot
+be repeated. The capture above is the record; nothing in this repository depends
+on the tenant still being alive to remain true.

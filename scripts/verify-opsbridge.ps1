@@ -640,6 +640,51 @@ try {
                 else {
                     Add-Result -Check 'deployed API /healthz' -Status 'FAIL' -Detail "https://$fqdn/healthz did not return 200: $($cloud.Content)"
                 }
+
+                # Security regression check, not a health check. /metrics returns
+                # live tenant data and MUST refuse an unauthenticated caller. A
+                # 200 here means the authentication has been removed and real
+                # ticket counts are public again - that is a FAIL, not a warning.
+                # The app is already warm from the probe above, so no cold start.
+                $metricsUrl = "https://$fqdn/metrics"
+                $metricsCode = 0
+                try {
+                    $resp = Invoke-WebRequest -Uri $metricsUrl -Method GET -TimeoutSec 30 -UseBasicParsing -ErrorAction Stop
+                    $metricsCode = [int] $resp.StatusCode
+                }
+                catch {
+                    if ($_.Exception.Response) { $metricsCode = [int] $_.Exception.Response.StatusCode }
+                    else { $metricsCode = 0 }
+                }
+
+                if ($metricsCode -eq 401) {
+                    Add-Result -Check '/metrics refuses anonymous' -Status 'PASS' -Detail '401 without a bearer token'
+                }
+                elseif ($metricsCode -eq 200) {
+                    Add-Result -Check '/metrics refuses anonymous' -Status 'FAIL' -Detail 'returned 200 with NO token - live tenant data is public'
+                }
+                elseif ($metricsCode -eq 503) {
+                    Add-Result -Check '/metrics refuses anonymous' -Status 'FAIL' -Detail '503 - METRICS_API_TOKEN is not configured, so the endpoint is refusing everyone'
+                }
+                elseif ($metricsCode -eq 0) {
+                    Add-Result -Check '/metrics refuses anonymous' -Status 'SKIP' -Detail "no HTTP response from $metricsUrl"
+                }
+                else {
+                    Add-Result -Check '/metrics refuses anonymous' -Status 'FAIL' -Detail "expected 401, got $metricsCode"
+                }
+
+                # The public demo surface is what a reader following the README
+                # actually opens, and it must never be mistaken for live data.
+                $demo = Test-HttpEndpoint -Url "https://$fqdn/demo/metrics" -TimeoutSec 30
+                if (-not $demo.Ok) {
+                    Add-Result -Check '/demo/metrics is public' -Status 'FAIL' -Detail "did not return 200: $($demo.Content)"
+                }
+                elseif ($demo.Content -match '"synthetic"\s*:\s*true') {
+                    Add-Result -Check '/demo/metrics is public' -Status 'PASS' -Detail '200, and labelled synthetic in the body'
+                }
+                else {
+                    Add-Result -Check '/demo/metrics is public' -Status 'FAIL' -Detail '200 but the body does not declare itself synthetic'
+                }
             }
 
             $job = Invoke-Native -FilePath $AzCli -CommandArgs (@(
