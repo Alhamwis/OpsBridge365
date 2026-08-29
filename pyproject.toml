@@ -9,7 +9,7 @@ description = "OpsBridge365 cloud layer: Microsoft Graph -> SharePoint sync job 
 readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
-authors = [{ name = "Saif Al Hamwi" }]
+authors = [{ name = "Saif Eddine Al Hamwi" }]
 
 dependencies = [
     "fastapi>=0.110",

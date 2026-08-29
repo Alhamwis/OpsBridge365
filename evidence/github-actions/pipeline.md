@@ -1,8 +1,18 @@
 # CI/CD pipeline evidence
 
+> **HISTORICAL EVIDENCE — captured 2026-08-18.** This file documents the **first**
+> fully green deploy — run `32115509179`, commit `63c4616` — and the four
+> failures that preceded it. It is not a statement about the current pipeline.
+> Later runs have deployed since; the most recent successful deploy at the time
+> of writing was run `32122134218` at commit `550f737`. For what is deployed now,
+> read the
+> [Actions run list](https://github.com/Alhamwis/OpsBridge365/actions/workflows/deploy.yml)
+> and [`../../docs/STATUS.md`](../../docs/STATUS.md) rather than a run id pinned
+> in a markdown file.
+
 `.github/workflows/deploy.yml`, on push to `main`.
 
-## The green run — `32115509179`
+## The first green run — 2026-08-18, run `32115509179` (commit `63c4616`)
 
 | Job | Result |
 | --- | --- |
@@ -12,9 +22,9 @@
 | `deploy to Azure` | ✅ SUCCESS |
 
 Full green, end to end: **push to deploy through OIDC, with no stored Azure
-credential.** There is no client secret, no service-principal password and no
-`creds:` JSON blob in the workflow. GitHub mints a short-lived OIDC token for
-this repository, `azure/login@v2` exchanges it, and the token dies with the job.
+credential.** There was no client secret, no service-principal password and no
+`creds:` JSON blob in the workflow. GitHub minted a short-lived OIDC token for
+this repository, `azure/login` exchanged it, and the token died with the job.
 
 The deploy job carries its own verification, and either check failing fails the
 job:
@@ -26,16 +36,21 @@ job:
 Both passed. The resources they verified are listed in
 [`../azure/deployment.md`](../azure/deployment.md).
 
-The gate order is unchanged and was exercised on the way through: `secret-scan`
-**and** `test` both gate `build-and-push`, which gates `deploy`, so nothing
-reaches ghcr.io — and therefore nothing reaches Azure — without a clean history
-scan and a green test suite.
+> The retry window in check 1 turned out to be load-bearing rather than generous.
+> A cold start re-measured on 2026-08-29 against a genuinely idle app took
+> **20.2 s**, not the 714 ms recorded on 2026-08-18. A single un-retried probe
+> would be a coin flip.
+
+The gate order was exercised on the way through: `secret-scan` **and** `test`
+both gate `build-and-push`, which gates `deploy`, so nothing reaches ghcr.io —
+and therefore nothing reaches Azure — without a clean history scan and a green
+test suite.
 
 ---
 
-## The three runs before it, and why each failed
+## The four failures before it, and why each was different
 
-This is the more useful half of the record. Three earlier runs failed for three
+This is the more useful half of the record. Four deploy attempts failed for four
 genuinely different reasons, and none of them was a code defect.
 
 ### 1. `AADSTS700213` — the job is environment-gated
@@ -50,7 +65,7 @@ AADSTS700213: No matching federated identity record found for presented assertio
 The federated credential on `opsbridge-deploy` had been created with subject
 `repo:Alhamwis/OpsBridge365:ref:refs/heads/main` — which reads correctly and
 matches the workflow's trigger, and is wrong. The deploy job declares
-`environment: production`, and **an environment-gated job presents
+`environment: production`, and **a job that declares an environment presents
 `...:environment:production`, not `...:ref:refs/heads/main`.** The branch does
 not appear in the subject at all.
 
@@ -78,9 +93,9 @@ workaround.
 
 ### 3. `RequestDisallowedByAzure` — the region is policy-restricted
 
-Azure for Students enforces an allowed-regions policy. Permitted:
+Azure for Students enforces an allowed-regions policy. Permitted at the time:
 `northcentralus`, `mexicocentral`, `westus2`, `westus`, `canadacentral`.
-**`eastus` is not allowed**, and `eastus` was the default everywhere. The
+**`eastus` was not allowed**, and `eastus` was the default everywhere. The
 resource group was recreated in `westus2`.
 
 ### 4. `MissingSubscriptionRegistration` — fresh subscription, no providers
@@ -101,8 +116,38 @@ real subscription: an identity provider's subject format, a subscription's polic
 assignment, a subscription's provider registration state.
 
 That is the case for deploying rather than reasoning about deploying, and it is
-why run `32115509179` is the only run in this repository that is described as a
-successful deploy.
+why run `32115509179` is the **first** run in this repository that deployed
+successfully. It is not the last: run `32122134218` at commit `550f737` deployed
+too, and the run list linked at the top of this file is the only place that
+answers "what deployed the thing that is running now".
 
 Every one of the four is written up as a reproduction-and-fix in
 [`../../docs/DEPLOYMENT.md`](../../docs/DEPLOYMENT.md#things-that-will-bite-you).
+
+---
+
+## How the pipeline has changed since this run
+
+The run above is a record of a pipeline that no longer exists in that form.
+Changes made since, none of them captured as evidence here — the workflow files
+are the record:
+
+- Every third-party action is pinned to a **full 40-character commit SHA** with
+  the version in a trailing comment. At the time of this run they were tags,
+  which are movable refs.
+- `ruff` no longer carries `continue-on-error: true`. Lint is a **hard gate**: it
+  blocks the image build and therefore the deploy.
+- Added: **CodeQL** (python, `security-extended`), **Trivy** filesystem and image
+  scans, and an **SPDX SBOM** uploaded as a build artifact. The Trivy policy is
+  that CRITICAL/HIGH findings *with a fix available* fail the build; findings with
+  no fix are reported and do not block.
+- Added **Dependabot** for pip, docker and github-actions — weekly, grouped —
+  plus `dependency-review` on pull requests.
+- Dependencies install from a hash-pinned lock with
+  `pip install --require-hashes --no-deps -r ...`.
+- `GRAPH_CLIENT_SECRET` is no longer a GitHub secret. Secret values and the Key
+  Vault role assignment moved to `infra/bootstrap.bicep`, which a human runs once,
+  so the routine deploy identity needs only Contributor.
+- A separate scheduled workflow, `.github/workflows/health.yml`, probes
+  `/healthz` every four hours. It never redeploys on failure — it leaves the run
+  red for a human to look at.

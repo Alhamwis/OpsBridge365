@@ -1,6 +1,12 @@
 # Test evidence — summary
 
-**58 offline + 12 live = 70 tests, all passing.**
+> **HISTORICAL EVIDENCE — captured 2026-08-18.** This records the suite as it
+> stood on that date: **58 offline + 12 live**. The offline suite is **106** as of
+> 2026-08-29 — see [`../../docs/STATUS.md`](../../docs/STATUS.md) and
+> [What has been added since](#what-has-been-added-since). The counts below are
+> not current; the descriptions of what each half covers still are.
+
+**58 offline + 12 live = 70 tests, all passing on 2026-08-18.**
 
 ```
 $ python -m pytest -q
@@ -53,7 +59,7 @@ job owns — and it restores the original value in a `finally` block.
 
 Several are negative tests, and they are the ones to show a security reviewer:
 
-| Assertion | Result |
+| Assertion | Result on 2026-08-18 |
 | --- | --- |
 | A wrong client secret raises `GraphAuthError` | ✅ |
 | `/drive` and `/drive/root/children` on an **ungranted** site | **403 accessDenied** |
@@ -70,6 +76,30 @@ configured tenant. `Sites.Selected` does not hide a site's existence; it
 withholds the site's data and refuses enumeration. The security property was
 real, the assertion was aimed at the wrong surface.
 
+The tenant is an `O365_BUSINESS_PREMIUM` trial with a lifecycle date of
+**2026-09-16** (measured 2026-08-29), so the live half of this suite is not
+reproducible indefinitely. The offline half reaches no tenant and is unaffected.
+
+## What has been added since
+
+The offline suite grew from 58 to **106** with the release that authenticated
+`/metrics`. The integration suite is unchanged at 12. The new tests are offline
+and deterministic — no network, no real clock — and they exist because the
+behaviours they cover had to be provable without a tenant:
+
+| New file | What it pins |
+| --- | --- |
+| `tests/test_security.py` | 401 with no token, a wrong token, the wrong scheme, an empty bearer, and a token *prefix*; that a rejected request never reaches Graph; that a 401 body does not disclose the expected token; and that an unconfigured `METRICS_API_TOKEN` refuses rather than opening the endpoint |
+| `tests/test_ratelimit.py` | The sliding window itself — the request over the limit is refused, the window slides rather than resetting, `Retry-After` counts down, keys are isolated, and key growth is bounded |
+| `tests/test_cache.py` | TTL behaviour, and single-flight: concurrent misses collapse into **one** upstream call, a failing factory is not cached, and every concurrent caller sees the same failure |
+| `tests/test_security.py`, continued | 429 on a burst with a countdown `Retry-After`, that repeated authenticated calls inside the cache window reach Graph **once**, and the 25-second deadline turning a hung upstream into **504** |
+| `tests/test_api.py`, extended | Cache hit/miss accounting on the `X-Cache` header, `Cache-Control: private` so no shared proxy stores tenant data, that a failed refresh is not cached, and `/demo/metrics` being public, labelled synthetic in the body, and making no upstream call |
+
+That list is also the argument for checking the token inside the process rather
+than using Container Apps' built-in Entra authentication: platform auth validates
+above the process, so not one of these assertions could be made by an offline
+suite.
+
 ## What the tests do not cover
 
 The suite is the reason to trust the application logic. It is not the reason to
@@ -78,9 +108,9 @@ siblings is for:
 
 | Question | Where it is answered |
 | --- | --- |
-| Does the pipeline deploy? | [`../github-actions/pipeline.md`](../github-actions/pipeline.md) — run `32115509179`, four jobs green |
+| Does the pipeline deploy? | [`../github-actions/pipeline.md`](../github-actions/pipeline.md) — the first green run, `32115509179`, four jobs green on 2026-08-18 |
 | Does the job run in Azure and write SharePoint? | [`../sharepoint/reconciliation.md`](../sharepoint/reconciliation.md) |
-| Does the API serve from a cold start? | [`../azure/deployment.md`](../azure/deployment.md) — 714 ms cold, 143 ms warm |
+| Does the API serve from a cold start? | [`../azure/deployment.md`](../azure/deployment.md) — **20.2 s** cold, 248 ms warm, re-measured 2026-08-29. The 714 ms this row used to quote was wrong |
 | Does the failure alert fire? | [`../monitoring/alerting.md`](../monitoring/alerting.md) — the first version did not |
 
 Notably, **no test caught the alert defect.** Nothing in pytest reaches a
@@ -89,9 +119,13 @@ and asking the query what it saw.
 
 ## Reproducing
 
+These commands are current rather than a transcript, and the counts are what they
+print today:
+
 ```bash
-pip install -e ".[dev]"
-python -m pytest -q                        # 58 passed, 12 deselected
+pip install --require-hashes --no-deps -r requirements-dev.txt
+pip install --no-deps -e .
+python -m pytest -q                        # 106 passed, 12 deselected
 python -m pytest -m integration -q         # 12 passed, with tenant credentials set
 pytest -m ""                               # both
 ```

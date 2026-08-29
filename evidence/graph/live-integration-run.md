@@ -1,16 +1,30 @@
 # Live Graph integration evidence
 
-Executed against the real OpsBridge365 Microsoft 365 tenant by the supervising agent.
-Tenant, app and site identifiers are deliberately omitted from this public repo.
+> **HISTORICAL EVIDENCE — captured 2026-08-18.** One run of the opt-in
+> integration suite against the real tenant. It has not been re-run, and it is
+> not a claim that the tenant is reachable today. For current state, see
+> [`../../docs/STATUS.md`](../../docs/STATUS.md).
 
-## Result
+Executed against the real OpsBridge365 Microsoft 365 tenant with the
+`opsbridge-graph` application identity (client credentials), by the repository
+author. Tenant, app and site identifiers are deliberately omitted from this
+public repo.
+
+## Result, 2026-08-18
 
 ```
 12 passed, 58 deselected in 10.06s
 ```
 
-All twelve run against live Microsoft Graph with the `opsbridge-graph` application
-identity (client credentials). The offline suite is unaffected: `58 passed`.
+All twelve ran against live Microsoft Graph. The offline suite was unaffected:
+`58 passed`. That deselected count is the offline suite as it stood on the day —
+it is 106 now, so the same command today prints `12 passed, 106 deselected`.
+
+> **This run is not indefinitely reproducible.** The Microsoft 365 subscription
+> is an `O365_BUSINESS_PREMIUM` **trial** with a `nextLifecycleDateTime` of
+> **2026-09-16** (measured 2026-08-29). If it lapses, the site and both lists go
+> with it and this suite cannot be re-run. The offline suite is unaffected — it
+> reaches no tenant.
 
 ## What Sites.Selected actually enforces
 

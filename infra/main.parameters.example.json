@@ -4,9 +4,21 @@
   "_comment": [
     "TEMPLATE ONLY - every value below is a placeholder. Copy this file to",
     "infra/main.parameters.json (gitignored) and fill it in.",
-    "Leave clientSecret empty here and pass it on the command line instead:",
-    "  --parameters clientSecret=$env:GRAPH_CLIENT_SECRET",
-    "so the real secret never touches a file in the repo. This repo is public.",
+    "",
+    "There is no clientSecret parameter here any more, and main.bicep no longer",
+    "declares one. The Graph client secret is written to Key Vault ONCE by",
+    "infra/bootstrap.bicep; this routine template only references the vault.",
+    "Passing clientSecret= to main.bicep now fails with 'the following",
+    "parameters were supplied but not declared'. That is the intended behaviour:",
+    "the routine deployment path cannot carry a secret even by accident.",
+    "",
+    "PREREQUISITE: infra/bootstrap.bicep must have been run against this resource",
+    "group first. main.bicep looks up the Key Vault and the managed identity as",
+    "'existing' resources and fails loudly if they are not there.",
+    "",
+    "location is omitted on purpose - main.bicep defaults it to the resource",
+    "group's own region. Pinning it here is how the group ended up created in a",
+    "region the subscription policy forbids.",
     "",
     "graphTenantId is the MICROSOFT 365 tenant that owns the Graph app",
     "registration and the SharePoint site - NOT the Azure tenant that owns the",
@@ -14,9 +26,6 @@
     "using the Azure one here deploys fine and then fails every Graph call."
   ],
   "parameters": {
-    "location": {
-      "value": "eastus"
-    },
     "namePrefix": {
       "value": "opsbridge"
     },
@@ -28,9 +37,6 @@
     },
     "clientId": {
       "value": "00000000-0000-0000-0000-000000000000"
-    },
-    "clientSecret": {
-      "value": ""
     },
     "sharePointSiteId": {
       "value": "REPLACE-WITH-SHAREPOINT-SITE-ID"

@@ -1,0 +1,88 @@
+# =============================================================================
+# Dependabot - Python, Docker, GitHub Actions
+# =============================================================================
+# Everything in this repository is pinned: dependencies by hash in
+# requirements*.txt, the base image by digest, and every action by commit SHA.
+# Pinning without automation is how a project ends up two years behind, so
+# Dependabot is the other half of that decision - it turns each bump into a
+# reviewable, test-gated pull request instead of a silent drift.
+#
+# Updates are grouped weekly rather than filed per-package: eleven separate PRs
+# on a Monday morning get rubber-stamped, and rubber-stamping a dependency bump
+# is the failure this is meant to prevent.
+#
+# Every PR runs the full `ci` workflow, and `main` requires those checks, so a
+# bump that breaks the build cannot merge.
+#
+# NOTE ON requirements*.txt: Dependabot edits these files, but they are
+# generated. After accepting a bump, regenerate them so the hashes and the
+# transitive set stay consistent - the command is in docs/DEPLOYMENT.md.
+# =============================================================================
+
+version: 2
+
+updates:
+  # ------------------------------------------------------------------ python --
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    groups:
+      python-runtime:
+        patterns:
+          - "fastapi"
+          - "uvicorn*"
+          - "httpx"
+          - "msal"
+          - "pydantic*"
+          - "starlette"
+      python-dev:
+        patterns:
+          - "pytest*"
+          - "respx"
+          - "ruff"
+    labels:
+      - dependencies
+      - python
+    commit-message:
+      prefix: "deps"
+
+  # ------------------------------------------------------------------ docker --
+  # The base image is pinned by digest, so without this the container would
+  # never receive an OS security update.
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: "deps"
+
+  # --------------------------------------------------------- github actions --
+  # Actions are pinned to commit SHAs. Dependabot updates the SHA and the
+  # trailing version comment together, which is the only maintainable way to
+  # keep immutable pins current.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "ci"

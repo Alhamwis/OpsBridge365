@@ -1,11 +1,17 @@
 # Monitoring evidence — and the alert defect that testing found
 
+> **HISTORICAL EVIDENCE — captured 2026-08-18.** A record of one controlled
+> failure and what the alert query did about it. The rule has not been re-tested
+> since, so this file says the query was correct on that date, not that the alert
+> is working today. For current state, see
+> [`../../docs/STATUS.md`](../../docs/STATUS.md).
+
 Log Analytics workspace `opsbridge-logs` (PerGB2018, 30-day retention), action
 group `opsbridge-alerts`, scheduled query rule `opsbridge-sync-failed`. The
 workspace comes from `infra/main.bicep`; the action group and the rule were
 created against it afterwards and are not in the template.
 
-| Setting | Value |
+| Setting | Value observed 2026-08-18 |
 | --- | --- |
 | Severity | 2 |
 | Evaluation frequency | 5 minutes |
@@ -72,10 +78,10 @@ restore was complete and the rule does not fire on success.
 | First | `config_error` | **0** |
 | Corrected | `config_error`, `graph_error`, `Traceback`, `CRITICAL` | **2** |
 
-## 5. Why this is the most valuable thing in this directory
+## 5. What the defect shows
 
-Every other check here confirms something works. This one found a control that
-did not.
+Every other check in this directory confirms something works. This one found a
+control that did not.
 
 The defect was invisible to inspection: the rule was syntactically valid, it
 pointed at the right workspace, it had a sensible severity and window, and it
@@ -95,3 +101,22 @@ Two general rules come out of it, and both are cheap:
 The blast radius of the defect, had it shipped: a sync job failing every six
 hours, an asset register quietly going stale, and a dashboard reporting no
 alerts — which reads as health.
+
+## 6. What this file does not prove, and what has changed since
+
+**Delivery to a human was never proven.** The corrected query was verified to
+return 2 hits against the real failure and the action group exists, but no
+notification was traced end to end to an inbox. That is a further step and it is
+not claimed here.
+
+`opsbridge-alerts` and `opsbridge-sync-failed` were both still present in
+`rg-opsbridge365` on 2026-08-29 (`az resource list -g rg-opsbridge365`). Their
+existence was re-checked; the query was not re-tested.
+
+A second, independent detection path was added after this capture:
+`.github/workflows/health.yml` probes `/healthz` every four hours and on manual
+dispatch, with a bounded retry, no secrets, and no redeploy on failure — a failed
+run stays red for a human to look at. It watches the API, not the sync job, so it
+does not overlap with the rule above. It publishes no uptime percentage: six
+probes a day cannot support one.
+

@@ -13,25 +13,34 @@
     az sits on disk, fully working. That is a false negative, and a report that
     under-states what it could have checked is worse than one that checks less.
 
-    Resolve-AzCli therefore tries four sources, in order:
+    Resolve-AzCli therefore tries three sources, in order:
 
       1. Get-Command az            - the current process PATH
       2. the User PATH read live   - [Environment]::GetEnvironmentVariable
                                      reads the registry, not this process's
                                      stale copy, so an install that happened
                                      after this shell started is still found
-      3. the known OpsBridge tools path (literal, see below)
-      4. $env:LOCALAPPDATA\opsbridge-tools\azcli-venv\Scripts\az.bat
+      3. $env:LOCALAPPDATA\opsbridge-tools\azcli-venv\Scripts\az.bat
+                                   - the install this repo provisions
 
-    It returns the full path to invoke, or an empty string when all four fail -
+    It returns the full path to invoke, or an empty string when all three fail -
     and only then is "the Azure CLI is not installed" a true statement.
 
-    Why the literal path in step 3: this project's az lives in a pip venv under
+    Why step 3 exists at all: this project's az lives in a pip venv under
     %LOCALAPPDATA%\opsbridge-tools, not in Program Files, so there is no
-    registry key or standard location to probe. Step 4 covers the same install
-    for any other user profile; step 3 covers the case where LOCALAPPDATA is
-    unset or points somewhere else (a service account, a sudo-style elevation).
-    Neither step invents a path - both are checked with Test-Path first.
+    registry key or standard location to probe.
+
+    Why it is derived rather than hard-coded: an absolute path with a specific
+    user name in it only works on the machine it was written on, and it puts
+    that user name in a public repository. $env:LOCALAPPDATA resolves to the
+    profile actually running the script. Note the DOUBLE quotes on the
+    assignment below - single quotes would store the literal text
+    "$env:LOCALAPPDATA" and the probe would never match anything.
+
+    If LOCALAPPDATA is unset (a service account, some sudo-style elevations),
+    step 3 degrades to a relative path that Test-Path will simply not find, and
+    the not-found message says so. That is the correct outcome: guessing another
+    user's profile directory would be worse than reporting honestly.
 
 .OUTPUTS
     System.String - the az path, or '' when it could not be resolved.
@@ -122,6 +131,10 @@ function Get-AzCliNotFoundDetail {
     if ([string]::IsNullOrWhiteSpace($localAppData)) { $localAppData = '%LOCALAPPDATA%' }
     $profilePath = Join-Path -Path $localAppData -ChildPath $script:AzCliRelativePath
 
-    return ("az not found on PATH, in the live User PATH, at {0}, or at {1} - install it: https://aka.ms/installazurecli" -f
-        $script:AzCliFallbackPath, $profilePath)
+    # $script:AzCliFallbackPath is itself derived from $env:LOCALAPPDATA, so it
+    # and $profilePath are the same string whenever LOCALAPPDATA is set. Naming
+    # one path twice reads like a bug in the message; list the distinct ones.
+    $searched = @($script:AzCliFallbackPath, $profilePath) | Select-Object -Unique
+    return ("az not found on PATH, in the live User PATH, or at {0} - install it: https://aka.ms/installazurecli" -f
+        ($searched -join ' or '))
 }

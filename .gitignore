@@ -21,3 +21,15 @@ azure-credentials.json
 # Filled-in Bicep parameters. Only the placeholder example is committed.
 infra/main.parameters.json
 !infra/main.parameters.example.json
+
+# Generated build-process state. This was tracked once and has been removed
+# from the history: it carried machine-specific context and build-tool
+# narration that has no place in a public repository. The durable technical
+# content it held now lives in docs/.
+opsbridge-state.json
+
+# SBOMs and scan reports are produced by CI and attached to the run as
+# artifacts. They are build outputs, not source.
+*.sbom.json
+*.spdx.json
+trivy-report.*

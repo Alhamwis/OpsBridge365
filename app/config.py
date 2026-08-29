@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     assets_list_id: str
     tickets_list_id: str
 
+    # Bearer token guarding GET /metrics. Optional because the sync job shares
+    # this Settings class and has no HTTP surface; the API refuses to serve live
+    # data when it is unset, so "optional" never means "open".
+    metrics_api_token: str | None = None
+
     graph_scope: str = "https://graph.microsoft.com/.default"
     app_version: str = "0.1.0"
 

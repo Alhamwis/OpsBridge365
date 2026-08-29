@@ -24,10 +24,14 @@ ENV_VARS: dict[str, str] = {
     "SHAREPOINT_SITE_ID": "contoso.sharepoint.com,site-guid,web-guid",
     "ASSETS_LIST_ID": "assets-list-guid",
     "TICKETS_LIST_ID": "tickets-list-guid",
+    "METRICS_API_TOKEN": "unit-test-metrics-token-not-a-credential-000",
     "APP_VERSION": "9.9.9-test",
 }
 
 TEST_TOKEN = "test-token-not-a-real-jwt"
+
+#: Authorization header that satisfies ``require_metrics_auth`` under ``configured_env``.
+AUTH_HEADER: dict[str, str] = {"Authorization": f"Bearer {ENV_VARS['METRICS_API_TOKEN']}"}
 
 
 class FakeMsalApp:
@@ -58,6 +62,26 @@ def settings() -> Settings:
         assets_list_id=ENV_VARS["ASSETS_LIST_ID"],
         tickets_list_id=ENV_VARS["TICKETS_LIST_ID"],
     )
+
+
+@pytest.fixture(autouse=True)
+def reset_api_state() -> Iterator[None]:
+    """Clear the process-wide metrics cache and rate limiter around every test.
+
+    Both are module-level singletons because the container runs one replica and
+    computes one value. That is right in production and poisonous in a test
+    suite: without this fixture a cached payload or a spent rate-limit budget
+    leaks from one test into the next, and the failure looks like a bug in the
+    endpoint rather than in the harness.
+    """
+    from app.main import metrics_cache
+    from app.security import metrics_rate_limiter
+
+    metrics_cache.invalidate()
+    metrics_rate_limiter.reset()
+    yield
+    metrics_cache.invalidate()
+    metrics_rate_limiter.reset()
 
 
 @pytest.fixture(autouse=True)

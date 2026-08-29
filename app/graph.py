@@ -34,6 +34,13 @@ BACKOFF_BASE_SECONDS = 1.0
 MAX_RETRY_AFTER_SECONDS = 60.0
 MAX_PAGES = 1000
 DEFAULT_TIMEOUT_SECONDS = 30.0
+
+# MSAL's default is no timeout at all: ConfidentialClientApplication only
+# applies one when explicitly given, so without this a hung Entra endpoint
+# blocks the caller forever. Token acquisition is a discovery GET plus a token
+# POST, both of which should answer in well under this.
+MSAL_TIMEOUT_SECONDS = 20.0
+
 _ERROR_BODY_LIMIT = 500
 
 RETRYABLE_STATUS = frozenset({429, 503})
@@ -202,11 +209,18 @@ class GraphClient:
         return self._client
 
     def _app(self) -> msal.ConfidentialClientApplication:
+        """Build the MSAL application once and keep it.
+
+        Construction is not cheap - it performs tenant discovery against the
+        authority - and the instance owns the in-memory token cache, so a fresh
+        one per call means a fresh token per call.
+        """
         if self._msal_app is None:
             self._msal_app = msal.ConfidentialClientApplication(
                 client_id=self._settings.azure_client_id,
                 client_credential=self._settings.azure_client_secret,
                 authority=self._settings.authority,
+                timeout=MSAL_TIMEOUT_SECONDS,
             )
         return self._msal_app
 
@@ -231,6 +245,18 @@ class GraphClient:
     def auth_headers(self) -> dict[str, str]:
         return {"Authorization": f"Bearer {self.get_token()}", "Accept": "application/json"}
 
+    async def auth_headers_async(self) -> dict[str, str]:
+        """``auth_headers`` without blocking the event loop.
+
+        MSAL is synchronous and uses ``requests``. Called directly from a
+        coroutine it stalls the whole loop for the duration of a token
+        acquisition - and this API runs at ``maxReplicas: 1``, so that stall is
+        every concurrent request on the service, not just this one. A cached
+        token still short-circuits inside MSAL; only the miss pays for the
+        thread hop.
+        """
+        return await asyncio.to_thread(self.auth_headers)
+
     async def request_json(
         self,
         method: str,
@@ -244,7 +270,7 @@ class GraphClient:
             self._client,
             method,
             url,
-            headers=self.auth_headers(),
+            headers=await self.auth_headers_async(),
             params=params,
             json=json,
         )
