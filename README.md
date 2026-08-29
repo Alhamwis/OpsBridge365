@@ -251,8 +251,19 @@ healthy because it was healthy in August.
 The Microsoft 365 tenant runs on an **O365_BUSINESS_PREMIUM trial** — Graph
 reports `isTrial: true` with a `nextLifecycleDateTime` of **2026-09-16**. Before
 that date, turn off recurring billing in the Microsoft 365 admin center
-(*Billing → Your products*), or it converts to paid. Microsoft exposes no
-supported Graph or CLI API for this, so it cannot be scripted.
+or it converts to paid. Microsoft exposes no supported Graph or CLI API for
+this, so it cannot be scripted. The exact path, checked against Microsoft's
+current documentation:
+
+1. Microsoft 365 admin center → **Billing** (Simplified view), or
+   **Billing → Your products** (Dashboard view)
+2. Select the OpsBridge365 subscription
+3. **Edit recurring billing** → **Off** → **Save**
+
+Turning recurring billing off does **not** cancel anything: the subscription
+stays active until it expires, so the tenant, the SharePoint site and the Graph
+identity keep working until then. That is the difference between this and
+*Cancel subscription*, which takes effect immediately.
 
 If it lapses, `/healthz` and `/demo/metrics` keep working and `/metrics` starts
 returning `502` — honestly failing rather than serving stale numbers as if they

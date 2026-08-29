@@ -65,6 +65,31 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 
+# Apply the distribution's security updates on top of the pinned base.
+#
+# This is a real trade-off, taken deliberately. A digest pin makes the starting
+# point reproducible and freezes its vulnerabilities with it; the base image is
+# rebuilt on Docker Hub's schedule, not Debian's security schedule, so there is
+# a window where a fix exists in the archive and not in the tag.
+#
+# That window is not hypothetical. This line was added because the CI image scan
+# failed the build - correctly - on CVE-2026-14456, a HIGH-severity denial of
+# service in OpenSSL. Debian had published the fix (3.5.7-1~deb13u2) to
+# trixie-security; python:3.12-slim still shipped 3.5.6-1~deb13u2 and its digest
+# had not moved. Waiting for a rebuild would have meant shipping a known,
+# fixable HIGH, and the alternative - relaxing the scanner - is how a policy
+# stops meaning anything.
+#
+# The cost: two builds of the same commit on different days can differ, because
+# the archive moves. The digest above still pins what is being upgraded FROM, so
+# the delta is bounded and visible in the scan report attached to every run.
+# When the base image is eventually rebuilt, Dependabot bumps the digest and
+# this layer becomes a no-op rather than something to remember to remove.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
 # Fixed uid/gid so volume ownership and Azure pod security policy are predictable.
 RUN groupadd --gid 10001 appuser \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin appuser
